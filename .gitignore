@@ -1,2 +1,7 @@
 .DS_Store
 data/derived/combined.mp4
+
+# evaluation run artifacts
+outputs/
+__pycache__/
+*.pyc

@@ -1,0 +1,47 @@
+{
+  "episode_id": "blooper_01",
+  "video": "../data/穿帮镜头/1.mp4",
+  "entities": {
+    "characters": [
+      {
+        "id": "char_woman",
+        "description": "woman in orange cardigan",
+        "scheduled_shots": [1, 2, 3]
+      },
+      {
+        "id": "char_big_man",
+        "description": "man in black t-shirt",
+        "scheduled_shots": [1, 2, 3]
+      },
+      {
+        "id": "char_jacket_man",
+        "description": "man in brown jacket",
+        "scheduled_shots": [1, 2]
+      }
+    ],
+    "objects": [
+      {
+        "id": "obj_curry_plate",
+        "description": "plate of curry rice",
+        "scheduled_shots": [2]
+      },
+      {
+        "id": "obj_mustard_bottle",
+        "description": "yellow mustard bottle",
+        "scheduled_shots": [1]
+      }
+    ],
+    "backgrounds": [
+      {
+        "id": "bg_diner",
+        "description": "diner booth with wooden blinds and framed pictures",
+        "scheduled_shots": [1, 2, 3]
+      }
+    ]
+  },
+  "view_labels": {
+    "1": "wide_establishing",
+    "2": "table_medium",
+    "3": "closeup_pair"
+  }
+}
