@@ -24,7 +24,6 @@
 Input:
 - multi-shot generated video
 - structured prompt-specified entity list, if available
-- ground-truth view labels per shot, optional (仅用于评测器自检)
 ```
 
 shot 边界不作为输入：评测器始终从视频本身用算法检测 shot 边界（见 Step 1），
@@ -43,7 +42,7 @@ Output:
 - model-emergent self-consistency metrics
 - same-view background groups
 - same-view background consistency metrics
-- view confusion matrix
+- lowest-consistency pair exhibits (failure cases)
 ```
 
 ---
@@ -63,7 +62,7 @@ Multi-shot generated video
 → object consistency evaluation
 → background same-view grouping
 → same-view background consistency evaluation
-→ final metrics and confusion analysis
+→ final metrics and failure-case evidence
 ```
 
 这里的关键是：  
@@ -737,102 +736,85 @@ weight_G = |G| * (|G| - 1) / 2
 
 ---
 
-## 17. Step 10: View Confusion Matrix
+## 17. Final Metric Report
 
-### 17.1 目的
-
-分析 same-view grouping 是否发生：
-
-```text
-- over-merge: 不同视角被合并
-- over-split: 同一视角被拆开
-```
-
-### 17.2 标注形式
-
-人工标注采用 **per-shot 视角标签**（每个 shot 一个 view label，标注成本低于
-逐 pair 标注）；关键帧 pair 的 same-view / different-view 真值由所属 shot 的
-标签自动展开得到。
-
-构建 confusion matrix：
+最终报告按**元素类型**组织为三大块（人物 / 物体 / 背景），不混合为单一总分，
+全部为连续分数与统计量。人物与物体两块内部各分 prompt-specified 与
+model-emergent 两条 track；背景块不做实体级拆分，报告同视角一致性。
 
 ```text
-rows = predicted same-view groups
-columns = ground-truth view labels
-value = number of keyframes
+metrics.json
+├── characters
+│   ├── prompt_specified      # prompt 指定人物
+│   └── model_emergent        # 模型自发人物
+├── objects
+│   ├── prompt_specified      # prompt 指定物体
+│   └── model_emergent        # 模型自发物体
+└── background                # 同视角背景一致性
 ```
 
-### 17.3 报告指标
+### 17.1 Characters
 
-```text
-- pairwise precision
-- pairwise recall
-- pairwise F1
-- over-merge rate = FP / (TP + FP)
-- over-split rate = FN / (TP + FN)
-```
-
-无视角标签时该组指标报告为 unavailable，不参与也不影响其他三组分数。
-
----
-
-## 18. Final Metric Report
-
-最终报告分为四组，不混合为单一总分。
-
-### 18.1 Prompt-specified entity consistency
+prompt_specified：
 
 ```text
 - prompt_character_presence_rate
-- prompt_face_mean_similarity
-- prompt_face_centroid_similarity
+- prompt_face_detection_rate
+- prompt_face_mean / min / centroid_similarity, std
 - prompt_identity_pass_rate
-- prompt_object_presence_rate
-- prompt_object_mean_similarity
-- prompt_object_centroid_similarity
-- prompt_object_pass_rate
+- coverage: n_entities, n_comparable_pairs
+- per_entity 明细（含逐 pair 分数与最低分镜头对）
 ```
 
-### 18.2 Model-emergent self-consistency
+model_emergent：
 
 ```text
 - emergent_character_count
 - emergent_character_recurrence_rate
-- emergent_face_mean_similarity
-- emergent_face_centroid_similarity
+- emergent_face_mean / min / centroid_similarity, std
+- emergent_identity_fragmentation_rate
+- coverage: cluster_total, no_face_tracks
+- per_track 明细
+```
+
+### 17.2 Objects
+
+prompt_specified：
+
+```text
+- prompt_object_presence_rate
+- prompt_object_mean / min / centroid_similarity, std
+- prompt_object_pass_rate
+- coverage: n_entities, n_comparable_pairs
+- per_entity 明细
+```
+
+model_emergent：
+
+```text
 - emergent_object_count
 - emergent_object_recurrence_rate
-- emergent_object_mean_similarity
-- emergent_object_centroid_similarity
+- emergent_object_mean / min / centroid_similarity, std
+- emergent_object_fragmentation_rate
+- coverage: cluster_total
+- per_track 明细
 ```
 
-### 18.3 Background same-view consistency
+### 17.3 Background
 
 ```text
-- same_view_group_count
-- average_same_view_group_size
-- intra_group_bg_similarity
-- intra_group_depth_similarity
-- intra_group_edge_similarity
+- same_view_group_count / average_same_view_group_size
+- intra_group_bg / depth / edge_similarity
 - episode_same_view_consistency
-```
-
-### 18.4 View grouping quality
-
-```text
-- pairwise precision
-- pairwise recall
-- pairwise F1
-- over-merge rate
-- over-split rate
-- view confusion matrix
+- coverage: n_grouped / n_excluded keyframes, n_comparable_pairs
+- per_group 明细（含 medoid）
 ```
 
 ---
 
-## 19. Failure Case Taxonomy
+## 18. Failure Case Taxonomy
 
-### 19.1 Prompt-specified entity failures
+### 18.1 Prompt-specified entity failures
 
 ```text
 - prompt 指定人物缺失
@@ -842,7 +824,7 @@ value = number of keyframes
 - prompt 指定背景或地点发生漂移
 ```
 
-### 19.2 Model-emergent self-consistency failures
+### 18.2 Model-emergent self-consistency failures
 
 ```text
 - 模型自发生成的配角身份不稳定
@@ -852,7 +834,7 @@ value = number of keyframes
 - 不同视觉元素被错误合并为同一个 emergent track
 ```
 
-### 19.3 Same-view grouping failures
+### 18.3 Same-view grouping failures
 
 ```text
 - 同一地点不同视角被错误合并
@@ -863,7 +845,7 @@ value = number of keyframes
 
 ---
 
-## 20. Final Pipeline Summary
+## 19. Final Pipeline Summary
 
 ```text
 1. Detect shot boundaries (dual-signal + cross-gap verification)
@@ -912,16 +894,14 @@ value = number of keyframes
    - episode-level same-view consistency
 
 10. Output final report and evidence:
-   - prompt-specified entity consistency
-   - model-emergent self-consistency
+   - characters / objects: prompt-specified and model-emergent consistency
    - background same-view consistency
-   - view confusion matrix (when view labels provided)
    - lowest-consistency pair exhibits (failure_cases/)
 ```
 
 ---
 
-## 21. Deliverables
+## 20. Deliverables
 
 ```text
 pipeline_plan.md
@@ -948,7 +928,7 @@ scripts/
   run_eval.sh                      # env wrapper
 
 configs/
-  episode_*.json                   # per-episode: video / entities / view_labels
+  episode_*.json                   # per-episode: video / entities
 
 outputs/<episode_id>/
   shots.json
@@ -960,6 +940,5 @@ outputs/<episode_id>/
   entity_tracks.json
   same_view_groups.json
   metrics.json
-  view_confusion_matrix.png        # when view labels provided
   failure_cases/                   # lowest-consistency pair exhibits + manifest
 ```

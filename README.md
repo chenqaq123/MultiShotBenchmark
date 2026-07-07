@@ -11,10 +11,9 @@ quality self-check.
 ```
 src/                       evaluation suite (see pipeline_plan.md §22)
 configs/                   episode configs (video + shots + entities + view labels)
-outputs/<episode_id>/      keyframes/ masks/ crops/ embeddings/
+outputs/<episode_id>/      keyframes/ masks/ crops/ embeddings/ failure_cases/
                            shots.json keyframes.json proposals.json
                            entity_tracks.json same_view_groups.json metrics.json
-                           view_confusion_matrix.png (when view labels given)
 ```
 
 ## Models
@@ -48,8 +47,9 @@ export HF_HUB_CACHE=$HF_HOME/hub
 
 Episode config fields: `video` (required), `entities` (optional structured
 prompt-specified list, pipeline_plan §5.3; without it only the model-emergent
-and background tracks are scored), `view_labels` (optional ground-truth view
-labels per detected shot, enabling the view-grouping quality self-check).
+and background tracks are scored). Metrics are organized by element type —
+`characters` / `objects` (each split into prompt_specified vs model_emergent)
+and `background` (same-view consistency).
 
 Shot boundaries are always detected algorithmically from the video itself
 (`src/detect_shots.py`: dual-signal HSV-histogram + downscaled-pixel

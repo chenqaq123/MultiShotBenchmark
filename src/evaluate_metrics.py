@@ -1,9 +1,10 @@
-"""Steps 9–10: final metric report (four groups, no single blended score).
+"""Step 9: final metric report (scores only, no single blended score).
 
-1. prompt_specified   – presence + cross-shot identity/appearance stability
-2. model_emergent     – count / recurrence / self-consistency / fragmentation
-3. background_same_view – intra-group background & layout consistency
-4. view_grouping_quality – only when ground-truth view labels are provided
+Organized by element type, then by track:
+
+  characters:  prompt_specified | model_emergent
+  objects:     prompt_specified | model_emergent
+  background:  same-view consistency
 
 Dimensions without comparable evidence report coverage=0 and null scores
 (no pass/fail verdicts; thresholds only parameterize the *_pass_rate stats
@@ -13,7 +14,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from .common import DEFAULTS, Keyframe, Proposal, cosine
+from .common import DEFAULTS, Proposal, cosine
 
 
 # --------------------------------------------------------------------------
@@ -132,64 +133,71 @@ def _prompt_object_metrics(records: list[dict], prop_by_id: dict[str, Proposal],
 
 
 # --------------------------------------------------------------------------
-# group 2: model-emergent self-consistency
+# model-emergent self-consistency (characters / objects reported separately)
 # --------------------------------------------------------------------------
-def _emergent_metrics(emergent: dict, prop_by_id: dict[str, Proposal],
-                      feats: dict, cfg: dict) -> dict:
-    from .extract_object_features import object_pair_similarity
+def _emergent_track_details(tracks, prop_by_id, get_emb, threshold, sim_fn_factory=None):
+    details = []
+    for t in tracks:
+        items, embs, props = [], [], []
+        for pid in t["prop_ids"]:
+            e = get_emb(prop_by_id[pid])
+            if e is not None:
+                items.append((prop_by_id[pid].shot_index, prop_by_id[pid].kf_id, pid))
+                embs.append(e)
+                props.append(prop_by_id[pid])
+        sim_fn = sim_fn_factory(props) if sim_fn_factory else None
+        stats = _pair_stats(items, embs, threshold, sim_fn=sim_fn)
+        details.append({"track_id": t["track_id"], "shots": t["shots"],
+                        "labels": t["labels"], "n_members": len(t["prop_ids"]),
+                        "similarity": stats})
+    return details
 
-    def track_stats(tracks, get_emb, threshold, blended=False):
-        details = []
-        for t in tracks:
-            items, embs, props = [], [], []
-            for pid in t["prop_ids"]:
-                e = get_emb(prop_by_id[pid])
-                if e is not None:
-                    items.append((prop_by_id[pid].shot_index, prop_by_id[pid].kf_id, pid))
-                    embs.append(e)
-                    props.append(prop_by_id[pid])
-            sim_fn = (lambda i, j: object_pair_similarity(props[i], props[j], feats, cfg)) \
-                if blended else None
-            stats = _pair_stats(items, embs, threshold, sim_fn=sim_fn)
-            details.append({"track_id": t["track_id"], "shots": t["shots"],
-                            "labels": t["labels"], "n_members": len(t["prop_ids"]),
-                            "similarity": stats})
-        return details
 
-    char_details = track_stats(
-        emergent["characters"],
+def _emergent_character_metrics(emergent: dict, prop_by_id: dict[str, Proposal],
+                                cfg: dict) -> dict:
+    details = _emergent_track_details(
+        emergent["characters"], prop_by_id,
         lambda p: np.asarray(p.face_embedding, np.float32) if p.face_embedding else None,
         cfg["face_match_threshold"])
-    obj_details = track_stats(
-        emergent["objects"],
-        lambda p: feats["dino"].get(p.prop_id),
-        cfg["object_match_threshold"], blended=True)
-
-    n_char_clu = emergent["character_cluster_total"]
-    n_obj_clu = emergent["object_cluster_total"]
+    n_clu = emergent["character_cluster_total"]
     return {
         "emergent_character_count": len(emergent["characters"]),
         "emergent_character_recurrence_rate":
-            round(len(emergent["characters"]) / n_char_clu, 4) if n_char_clu else None,
-        "emergent_face_mean_similarity": _agg([d["similarity"]["mean"] for d in char_details]),
-        "emergent_face_min_similarity": _agg([d["similarity"]["min"] for d in char_details]),
-        "emergent_face_similarity_std": _agg([d["similarity"]["std"] for d in char_details]),
-        "emergent_face_centroid_similarity": _agg([d["similarity"]["centroid_mean"] for d in char_details]),
+            round(len(emergent["characters"]) / n_clu, 4) if n_clu else None,
+        "emergent_face_mean_similarity": _agg([d["similarity"]["mean"] for d in details]),
+        "emergent_face_min_similarity": _agg([d["similarity"]["min"] for d in details]),
+        "emergent_face_similarity_std": _agg([d["similarity"]["std"] for d in details]),
+        "emergent_face_centroid_similarity": _agg([d["similarity"]["centroid_mean"] for d in details]),
         "emergent_identity_fragmentation_rate":
             round(emergent["character_fragmentation_rate"], 4),
+        "coverage": {"cluster_total": n_clu,
+                     "no_face_tracks": len(emergent["characters_no_face"])},
+        "per_track": details,
+    }
+
+
+def _emergent_object_metrics(emergent: dict, prop_by_id: dict[str, Proposal],
+                             feats: dict, cfg: dict) -> dict:
+    from .extract_object_features import object_pair_similarity
+    details = _emergent_track_details(
+        emergent["objects"], prop_by_id,
+        lambda p: feats["dino"].get(p.prop_id),
+        cfg["object_match_threshold"],
+        sim_fn_factory=lambda props: (
+            lambda i, j: object_pair_similarity(props[i], props[j], feats, cfg)))
+    n_clu = emergent["object_cluster_total"]
+    return {
         "emergent_object_count": len(emergent["objects"]),
         "emergent_object_recurrence_rate":
-            round(len(emergent["objects"]) / n_obj_clu, 4) if n_obj_clu else None,
-        "emergent_object_mean_similarity": _agg([d["similarity"]["mean"] for d in obj_details]),
-        "emergent_object_min_similarity": _agg([d["similarity"]["min"] for d in obj_details]),
-        "emergent_object_similarity_std": _agg([d["similarity"]["std"] for d in obj_details]),
-        "emergent_object_centroid_similarity": _agg([d["similarity"]["centroid_mean"] for d in obj_details]),
+            round(len(emergent["objects"]) / n_clu, 4) if n_clu else None,
+        "emergent_object_mean_similarity": _agg([d["similarity"]["mean"] for d in details]),
+        "emergent_object_min_similarity": _agg([d["similarity"]["min"] for d in details]),
+        "emergent_object_similarity_std": _agg([d["similarity"]["std"] for d in details]),
+        "emergent_object_centroid_similarity": _agg([d["similarity"]["centroid_mean"] for d in details]),
         "emergent_object_fragmentation_rate":
             round(emergent["object_fragmentation_rate"], 4),
-        "coverage": {"character_cluster_total": n_char_clu,
-                     "object_cluster_total": n_obj_clu,
-                     "characters_no_face_tracks": len(emergent["characters_no_face"])},
-        "per_track": {"characters": char_details, "objects": obj_details},
+        "coverage": {"cluster_total": n_clu},
+        "per_track": details,
     }
 
 
@@ -241,64 +249,28 @@ def _background_metrics(groups: list[dict], scores: dict) -> dict:
 
 
 # --------------------------------------------------------------------------
-# group 4: view grouping quality (needs ground-truth view labels per shot)
-# --------------------------------------------------------------------------
-def _grouping_quality(groups: list[dict], keyframes: list[Keyframe],
-                      view_labels: dict | None) -> dict:
-    if not view_labels:
-        return {"available": False,
-                "note": "no ground-truth view labels provided; grouping self-check skipped"}
-    shot_of = {kf.kf_id: kf.shot_index for kf in keyframes}
-    group_of = {k: g["group_id"] for g in groups for k in g["kf_ids"]}
-    kfs = [k for k in group_of if str(shot_of[k]) in view_labels]
-    tp = fp = fn = tn = 0
-    for i in range(len(kfs)):
-        for j in range(i + 1, len(kfs)):
-            same_pred = group_of[kfs[i]] == group_of[kfs[j]]
-            same_gt = view_labels[str(shot_of[kfs[i]])] == view_labels[str(shot_of[kfs[j]])]
-            tp += same_pred and same_gt
-            fp += same_pred and not same_gt
-            fn += (not same_pred) and same_gt
-            tn += (not same_pred) and (not same_gt)
-    prec = tp / (tp + fp) if tp + fp else None
-    rec = tp / (tp + fn) if tp + fn else None
-    f1 = (2 * prec * rec / (prec + rec)) if prec and rec else None
-    confusion: dict[str, dict[str, int]] = {}
-    for k in kfs:
-        confusion.setdefault(group_of[k], {}).setdefault(
-            view_labels[str(shot_of[k])], 0)
-        confusion[group_of[k]][view_labels[str(shot_of[k])]] += 1
-    return {"available": True,
-            "pairwise_precision": round(prec, 4) if prec is not None else None,
-            "pairwise_recall": round(rec, 4) if rec is not None else None,
-            "pairwise_f1": round(f1, 4) if f1 is not None else None,
-            "over_merge_rate": round(fp / (tp + fp), 4) if tp + fp else None,
-            "over_split_rate": round(fn / (tp + fn), 4) if tp + fn else None,
-            "pair_counts": {"tp": tp, "fp": fp, "fn": fn, "tn": tn},
-            "view_confusion_matrix": confusion}
-
-
-# --------------------------------------------------------------------------
 # entry point
 # --------------------------------------------------------------------------
-def evaluate_metrics(tracks: dict, proposals: list[Proposal], keyframes: list[Keyframe],
-                     feats: dict, same_view: dict, scores: dict,
-                     view_labels: dict | None = None, cfg: dict = DEFAULTS) -> dict:
+def evaluate_metrics(tracks: dict, proposals: list[Proposal], feats: dict,
+                     same_view: dict, scores: dict, cfg: dict = DEFAULTS) -> dict:
+    """Report organized by element type (characters / objects / background),
+    characters and objects split into prompt-specified vs model-emergent."""
     prop_by_id = {p.prop_id: p for p in proposals}
     groups = same_view["groups"]
-    char_m = _prompt_character_metrics(tracks["prompt"]["characters"], prop_by_id, cfg)
-    obj_m = _prompt_object_metrics(tracks["prompt"]["objects"], prop_by_id, feats, cfg)
     return {
-        "prompt_specified": {
-            **{k: v for k, v in char_m.items() if k not in ("coverage", "per_entity")},
-            **{k: v for k, v in obj_m.items() if k not in ("coverage", "per_entity")},
-            "coverage": {"characters": char_m["coverage"], "objects": obj_m["coverage"]},
-            "per_entity": {"characters": char_m["per_entity"],
-                           "objects": obj_m["per_entity"]},
+        "characters": {
+            "prompt_specified": _prompt_character_metrics(
+                tracks["prompt"]["characters"], prop_by_id, cfg),
+            "model_emergent": _emergent_character_metrics(
+                tracks["emergent"], prop_by_id, cfg),
         },
-        "model_emergent": _emergent_metrics(tracks["emergent"], prop_by_id, feats, cfg),
-        "background_same_view": _background_metrics(groups, scores),
-        "view_grouping_quality": _grouping_quality(groups, keyframes, view_labels),
+        "objects": {
+            "prompt_specified": _prompt_object_metrics(
+                tracks["prompt"]["objects"], prop_by_id, feats, cfg),
+            "model_emergent": _emergent_object_metrics(
+                tracks["emergent"], prop_by_id, feats, cfg),
+        },
+        "background": _background_metrics(groups, scores),
         "config": {k: v for k, v in cfg.items()
                    if isinstance(v, (int, float, str, list, dict))},
     }

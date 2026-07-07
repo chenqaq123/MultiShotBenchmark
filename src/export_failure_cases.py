@@ -17,21 +17,19 @@ from .common import DEFAULTS, Proposal, save_json
 
 def _collect_pairs(metrics: dict) -> list[dict]:
     out = []
-    ps = metrics["prompt_specified"]["per_entity"]
-    for ent in ps["characters"]:
+    for ent in metrics["characters"]["prompt_specified"]["per_entity"]:
         for pair in ent["face_similarity"]["pairs"]:
             out.append({"name": ent["entity_id"], "kind": "prompt_character",
                         "comparison": "face_embedding", **pair})
-    for ent in ps["objects"]:
+    for ent in metrics["objects"]["prompt_specified"]["per_entity"]:
         for pair in ent["object_similarity"]["pairs"]:
             out.append({"name": ent["entity_id"], "kind": "prompt_object",
                         "comparison": "object_embedding", **pair})
-    em = metrics["model_emergent"]["per_track"]
-    for track in em["characters"]:
+    for track in metrics["characters"]["model_emergent"]["per_track"]:
         for pair in track["similarity"]["pairs"]:
             out.append({"name": track["track_id"], "kind": "emergent_character",
                         "comparison": "face_embedding", **pair})
-    for track in em["objects"]:
+    for track in metrics["objects"]["model_emergent"]["per_track"]:
         for pair in track["similarity"]["pairs"]:
             out.append({"name": track["track_id"], "kind": "emergent_object",
                         "comparison": "object_embedding", **pair})

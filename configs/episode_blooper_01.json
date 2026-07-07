@@ -38,10 +38,5 @@
         "scheduled_shots": [1, 2, 3]
       }
     ]
-  },
-  "view_labels": {
-    "1": "wide_establishing",
-    "2": "table_medium",
-    "3": "closeup_pair"
   }
 }

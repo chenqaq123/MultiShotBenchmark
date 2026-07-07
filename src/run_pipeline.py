@@ -7,8 +7,7 @@ Episode config:
     {
       "episode_id": "...",
       "video": "path/to/video.mp4",
-      "entities": {"characters": [...], "objects": [...], "backgrounds": [...]},  # optional
-      "view_labels": {"1": "view_a", "2": "view_b", ...}   # optional, per detected shot
+      "entities": {"characters": [...], "objects": [...], "backgrounds": [...]}   # optional
     }
 
     Shot boundaries are always detected algorithmically from the video
@@ -19,7 +18,6 @@ from __future__ import annotations
 import argparse
 import time
 from dataclasses import asdict
-from pathlib import Path
 
 from .associate_entities import associate_entities
 from .cluster_same_view import cluster_same_view
@@ -100,9 +98,8 @@ def run_episode(episode_cfg_path: str, output_dir: str, device: str | None = Non
         f"(multi-frame={sum(g['size'] > 1 for g in same_view['groups'])}, "
         f"excluded kfs={len(same_view['excluded_kf_ids'])})")
 
-    # Steps 9/10: metrics
-    metrics = evaluate_metrics(tracks, proposals, keyframes, feats,
-                               same_view, scores, ep.get("view_labels"), cfg)
+    # Step 9: metrics
+    metrics = evaluate_metrics(tracks, proposals, feats, same_view, scores, cfg)
     metrics["episode_id"] = ep.get("episode_id")
     metrics["video"] = ep["video"]
 
@@ -119,35 +116,8 @@ def run_episode(episode_cfg_path: str, output_dir: str, device: str | None = Non
     save_json(tracks_out, dirs["root"] / "entity_tracks.json")
     save_json(same_view, dirs["root"] / "same_view_groups.json")
     save_json(metrics, dirs["root"] / "metrics.json")
-    _plot_confusion(metrics, dirs["root"])
     log(f"done -> {dirs['root'] / 'metrics.json'}")
     return metrics
-
-
-def _plot_confusion(metrics: dict, out_root: Path) -> None:
-    q = metrics.get("view_grouping_quality", {})
-    if not q.get("available"):
-        return
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-    import numpy as np
-    cm = q["view_confusion_matrix"]
-    rows = sorted(cm)
-    cols = sorted({c for r in cm.values() for c in r})
-    mat = np.array([[cm[r].get(c, 0) for c in cols] for r in rows])
-    fig, ax = plt.subplots(figsize=(1.2 + 0.8 * len(cols), 1.2 + 0.6 * len(rows)))
-    ax.imshow(mat, cmap="Blues")
-    ax.set_xticks(range(len(cols)), cols, rotation=45, ha="right")
-    ax.set_yticks(range(len(rows)), rows)
-    for i in range(len(rows)):
-        for j in range(len(cols)):
-            ax.text(j, i, mat[i, j], ha="center", va="center")
-    ax.set_xlabel("ground-truth view")
-    ax.set_ylabel("predicted group")
-    fig.tight_layout()
-    fig.savefig(out_root / "view_confusion_matrix.png", dpi=150)
-    plt.close(fig)
 
 
 def main() -> None:
