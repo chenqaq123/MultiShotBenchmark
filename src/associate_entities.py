@@ -1,19 +1,22 @@
 """Step 5: entity association.
 
 A. Proposals fired by a prompt-entity description query are assigned to that
-   entity (best score per scheduled shot; unmatched scheduled shots => missing).
+   entity. Per scheduled shot the winner maximizes a blend of grounding score
+   and embedding continuity with the entity's already-selected appearances
+   (unmatched scheduled shots => missing).
 B. Remaining person/object proposals form the model-emergent pool and are
-   clustered across shots (faces by ArcFace embedding, the rest by DINOv2).
+   clustered across shots (faces by ArcFace embedding, faceless persons by
+   DINOv2, objects by DINOv2 blended with color histograms for small crops).
 """
 from __future__ import annotations
 
 import numpy as np
 
-from .common import DEFAULTS, Proposal, box_iou, cosine
+from .common import DEFAULTS, Proposal, cosine
+from .extract_object_features import object_pair_similarity
 
 
-def _cluster(embs: np.ndarray, threshold_sim: float) -> np.ndarray:
-    """Average-linkage agglomerative clustering on cosine distance."""
+def _cluster_embeddings(embs: np.ndarray, threshold_sim: float) -> np.ndarray:
     from sklearn.cluster import AgglomerativeClustering
     if len(embs) == 0:
         return np.array([], dtype=int)
@@ -25,27 +28,59 @@ def _cluster(embs: np.ndarray, threshold_sim: float) -> np.ndarray:
     return clu.fit_predict(embs)
 
 
+def _cluster_precomputed(sim: np.ndarray, threshold_sim: float) -> np.ndarray:
+    from sklearn.cluster import AgglomerativeClustering
+    n = len(sim)
+    if n == 0:
+        return np.array([], dtype=int)
+    if n == 1:
+        return np.array([0])
+    clu = AgglomerativeClustering(n_clusters=None, metric="precomputed",
+                                  linkage="average",
+                                  distance_threshold=1.0 - threshold_sim)
+    return clu.fit_predict(1.0 - sim)
+
+
 def _assign_prompt_entities(entities: list[dict], proposals: list[Proposal],
-                            shot_of_kf: dict[str, int]) -> list[dict]:
+                            feats: dict, cfg: dict) -> list[dict]:
+    w = cfg["assoc_continuity_weight"]
     records = []
     for ent in entities:
         cands = [p for p in proposals if p.from_entity_query == ent["id"]]
         by_shot: dict[int, list[Proposal]] = {}
         for p in cands:
             by_shot.setdefault(p.shot_index, []).append(p)
-        appearances, missing = [], []
-        shots = ent["scheduled_shots"] or sorted(by_shot)
-        for shot in shots:
-            best = max(by_shot.get(shot, []), key=lambda p: p.score, default=None)
+        scheduled = ent["scheduled_shots"] or sorted(by_shot)
+        appearances, missing, selected_embs = [], [], []
+
+        def pick(shot: int) -> Proposal | None:
+            pool = by_shot.get(shot, [])
+            if not pool:
+                return None
+
+            def score(p: Proposal) -> float:
+                emb = feats["dino"].get(p.prop_id)
+                if selected_embs and emb is not None:
+                    centroid = np.mean(selected_embs, axis=0)
+                    return (1 - w) * p.score + w * max(0.0, cosine(emb, centroid))
+                return p.score
+
+            best = max(pool, key=score)
+            emb = feats["dino"].get(best.prop_id)
+            if emb is not None:
+                selected_embs.append(emb)
+            return best
+
+        for shot in scheduled:
+            best = pick(shot)
             if best is None:
                 missing.append(shot)
             else:
                 best.assigned_entity = ent["id"]
                 appearances.append({"shot": shot, "kf_id": best.kf_id,
                                     "prop_id": best.prop_id, "score": best.score})
-        # extra (non-scheduled) appearances, best per shot
-        for shot in sorted(set(by_shot) - set(shots)):
-            best = max(by_shot[shot], key=lambda p: p.score)
+        for shot in sorted(set(by_shot) - set(scheduled)):
+            best = pick(shot)
             best.assigned_entity = ent["id"]
             appearances.append({"shot": shot, "kf_id": best.kf_id,
                                 "prop_id": best.prop_id, "score": best.score,
@@ -87,16 +122,10 @@ def _overlap_over_smaller(b1, b2) -> float:
     return inter / smaller if smaller > 0 else 0.0
 
 
-def _make_tracks(pool: list[Proposal], embs: dict[str, np.ndarray],
-                 threshold_sim: float, prefix: str) -> tuple[list[dict], int]:
-    """Cluster pool by embedding; returns (recurring_tracks, n_clusters_total)."""
-    items = [p for p in pool if p.prop_id in embs]
-    if not items:
-        return [], 0
-    X = np.stack([embs[p.prop_id] for p in items])
-    labels = _cluster(X, threshold_sim)
-    tracks, n_total = [], len(set(labels))
-    for lbl in sorted(set(labels)):
+def _tracks_from_labels(items: list[Proposal], labels: np.ndarray, X: np.ndarray,
+                        prefix: str) -> tuple[list[dict], int]:
+    tracks, n_total = [], len(set(labels.tolist()))
+    for lbl in sorted(set(labels.tolist())):
         members = [p for p, l in zip(items, labels) if l == lbl]
         # one member per keyframe (a person box and its face box share the same
         # identity evidence — keep the larger box)
@@ -122,6 +151,31 @@ def _make_tracks(pool: list[Proposal], embs: dict[str, np.ndarray],
     return tracks, n_total
 
 
+def _make_embedding_tracks(pool: list[Proposal], embs: dict[str, np.ndarray],
+                           threshold_sim: float, prefix: str) -> tuple[list[dict], int]:
+    items = [p for p in pool if p.prop_id in embs]
+    if not items:
+        return [], 0
+    X = np.stack([embs[p.prop_id] for p in items])
+    labels = _cluster_embeddings(X, threshold_sim)
+    return _tracks_from_labels(items, labels, X, prefix)
+
+
+def _make_object_tracks(pool: list[Proposal], feats: dict, threshold_sim: float,
+                        prefix: str, cfg: dict) -> tuple[list[dict], int]:
+    items = [p for p in pool if p.prop_id in feats["dino"]]
+    if not items:
+        return [], 0
+    n = len(items)
+    sim = np.eye(n)
+    for i in range(n):
+        for j in range(i + 1, n):
+            sim[i, j] = sim[j, i] = object_pair_similarity(items[i], items[j], feats, cfg)
+    labels = _cluster_precomputed(sim, threshold_sim)
+    X = np.stack([feats["dino"][p.prop_id] for p in items])  # centroids stay DINOv2
+    return _tracks_from_labels(items, labels, X, prefix)
+
+
 def _fragmentation_rate(tracks: list[dict], threshold_sim: float, margin: float) -> float:
     if len(tracks) < 2:
         return 0.0
@@ -134,36 +188,30 @@ def _fragmentation_rate(tracks: list[dict], threshold_sim: float, margin: float)
 
 
 def associate_entities(proposals: list[Proposal], prompt_entities: dict,
-                       dino_embs: np.ndarray, cfg: dict = DEFAULTS) -> dict:
-    shot_of_kf = {p.kf_id: p.shot_index for p in proposals}
-
-    prompt_chars = _assign_prompt_entities(prompt_entities["characters"],
-                                           [p for p in proposals if p.kind == "person"],
-                                           shot_of_kf)
-    prompt_objs = _assign_prompt_entities(prompt_entities["objects"],
-                                          [p for p in proposals if p.kind == "object"],
-                                          shot_of_kf)
+                       feats: dict, cfg: dict = DEFAULTS) -> dict:
+    prompt_chars = _assign_prompt_entities(
+        prompt_entities["characters"],
+        [p for p in proposals if p.kind == "person"], feats, cfg)
+    prompt_objs = _assign_prompt_entities(
+        prompt_entities["objects"],
+        [p for p in proposals if p.kind == "object"], feats, cfg)
 
     pool = _emergent_pool(proposals)
     face_embs = {p.prop_id: np.asarray(p.face_embedding, np.float32)
                  for p in pool if p.kind == "person" and p.face_embedding}
-    dino_by_pid = {p.prop_id: dino_embs[p.dino_index] for p in pool
-                   if p.dino_index is not None}
-    faceless = {pid: e for pid, e in dino_by_pid.items()
-                if pid not in face_embs and
-                next(p for p in pool if p.prop_id == pid).kind == "person"}
-    obj_embs = {pid: e for pid, e in dino_by_pid.items()
-                if next(p for p in pool if p.prop_id == pid).kind == "object"}
+    faceless = {p.prop_id: feats["dino"][p.prop_id] for p in pool
+                if p.kind == "person" and p.prop_id not in face_embs
+                and p.prop_id in feats["dino"]}
 
-    char_tracks, n_char_clu = _make_tracks(
-        [p for p in pool if p.kind == "person" and p.prop_id in face_embs],
+    char_tracks, n_char_clu = _make_embedding_tracks(
+        [p for p in pool if p.prop_id in face_embs],
         face_embs, cfg["face_cluster_threshold"], "emergent_char")
-    charless_tracks, n_charless_clu = _make_tracks(
+    charless_tracks, n_charless_clu = _make_embedding_tracks(
         [p for p in pool if p.prop_id in faceless],
         faceless, cfg["object_cluster_threshold"], "emergent_person_noface")
-    obj_tracks, n_obj_clu = _make_tracks(
-        [p for p in pool if p.prop_id in obj_embs],
-        obj_embs, cfg["object_cluster_threshold"], "emergent_obj")
+    obj_tracks, n_obj_clu = _make_object_tracks(
+        [p for p in pool if p.kind == "object"],
+        feats, cfg["object_cluster_threshold"], "emergent_obj", cfg)
 
     return {
         "prompt": {"characters": prompt_chars, "objects": prompt_objs,

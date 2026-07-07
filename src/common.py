@@ -19,6 +19,7 @@ DEFAULTS = {
     "kf_min_blur": 40.0,                     # Laplacian variance floor
     "kf_min_brightness": 20.0,               # mean gray floor (black frame)
     "kf_max_brightness": 235.0,              # mean gray ceiling (white frame)
+    "kf_min_contrast": 15.0,                 # gray std floor (flat / fade frame)
     "kf_min_gap_sec": 0.4,                   # dedupe keyframes closer than this
     # shot detection (always algorithmic; never taken from prompt/config)
     "shot_adaptive_k": 8.0,                  # robust z-score (MAD units) to flag a cut
@@ -41,6 +42,13 @@ DEFAULTS = {
     "object_match_threshold": 0.60,          # cos sim: same object (pass rate)
     "object_cluster_threshold": 0.70,        # emergent object clustering
     "frag_margin": 0.05,                     # near-threshold centroid sim => fragmentation
+    "assoc_continuity_weight": 0.5,          # embedding-continuity share in association
+    "small_object_area_ratio": 0.02,         # below this, blend color histogram
+    "color_hist_weight": 0.3,                # histogram share for small-object similarity
+    # failure case export
+    "failure_case_top_k": 5,                 # lowest-consistency pairs to materialize
+    # medoid selection
+    "medoid_tolerance": 0.98,                # candidates within this factor of best mean sim
     # same-view grouping
     "same_view_weights": {"dino_bg": 0.60, "depth": 0.25, "edge": 0.15},
     "same_view_knn": 3,
@@ -141,7 +149,7 @@ def cosine(a: np.ndarray, b: np.ndarray) -> float:
 
 
 def p5_p95_normalize(values: np.ndarray) -> np.ndarray:
-    """S_norm = clip((S - p5) / (p95 - p5), 0, 1)  (pipeline_plan §15.2)."""
+    """S_norm = clip((S - p5) / (p95 - p5), 0, 1)  (pipeline_plan §14.2)."""
     v = np.asarray(values, dtype=np.float32)
     p5, p95 = np.percentile(v, 5), np.percentile(v, 95)
     if p95 - p5 < 1e-6:

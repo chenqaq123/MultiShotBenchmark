@@ -19,23 +19,37 @@ from .common import DEFAULTS, Keyframe, Proposal, cosine
 # --------------------------------------------------------------------------
 # helpers
 # --------------------------------------------------------------------------
-def _pair_stats(items: list[tuple], embs: list[np.ndarray], threshold: float) -> dict:
-    """items[i] = (shot, kf_id, prop_id) aligned with embs[i]."""
+def _pair_stats(items: list[tuple], embs: list[np.ndarray], threshold: float,
+                sim_fn=None) -> dict:
+    """items[i] = (shot, kf_id, prop_id) aligned with embs[i].
+
+    Pairwise similarity uses sim_fn(i, j) when given (e.g. blended object
+    similarity), cosine of embs otherwise. Centroid similarity (pipeline_plan
+    §9.4) is always computed from embs: cos(emb_i, mean of normalized embs).
+    """
+    empty = {"n_pairs": 0, "mean": None, "min": None, "std": None,
+             "pass_rate": None, "centroid_mean": None, "centroid_min": None,
+             "pairs": [], "lowest_pair": None}
+    if len(embs) < 2:
+        return empty
     pairs = []
     for i in range(len(embs)):
         for j in range(i + 1, len(embs)):
+            sim = sim_fn(i, j) if sim_fn else cosine(embs[i], embs[j])
             pairs.append({"a": items[i], "b": items[j],
-                          "similarity": round(cosine(embs[i], embs[j]), 4)})
-    if not pairs:
-        return {"n_pairs": 0, "mean": None, "min": None, "std": None,
-                "pass_rate": None, "pairs": [], "lowest_pair": None}
+                          "similarity": round(float(sim), 4)})
     sims = np.array([p["similarity"] for p in pairs])
     lowest = min(pairs, key=lambda p: p["similarity"])
+    normed = [np.asarray(e, np.float32) / (np.linalg.norm(e) + 1e-8) for e in embs]
+    centroid = np.mean(normed, axis=0)
+    csims = np.array([cosine(e, centroid) for e in normed])
     return {"n_pairs": len(pairs),
             "mean": round(float(sims.mean()), 4),
             "min": round(float(sims.min()), 4),
             "std": round(float(sims.std()), 4),
             "pass_rate": round(float((sims >= threshold).mean()), 4),
+            "centroid_mean": round(float(csims.mean()), 4),
+            "centroid_min": round(float(csims.min()), 4),
             "pairs": pairs, "lowest_pair": lowest}
 
 
@@ -75,6 +89,7 @@ def _prompt_character_metrics(records: list[dict], prop_by_id: dict[str, Proposa
         "prompt_face_mean_similarity": _agg([d["face_similarity"]["mean"] for d in details]),
         "prompt_face_min_similarity": _agg([d["face_similarity"]["min"] for d in details]),
         "prompt_face_similarity_std": _agg([d["face_similarity"]["std"] for d in details]),
+        "prompt_face_centroid_similarity": _agg([d["face_similarity"]["centroid_mean"] for d in details]),
         "prompt_identity_pass_rate": _agg([d["face_similarity"]["pass_rate"] for d in details]),
         "coverage": {"n_entities": len(records),
                      "n_comparable_pairs": sum(d["face_similarity"]["n_pairs"] for d in details)},
@@ -83,18 +98,21 @@ def _prompt_character_metrics(records: list[dict], prop_by_id: dict[str, Proposa
 
 
 def _prompt_object_metrics(records: list[dict], prop_by_id: dict[str, Proposal],
-                           dino_embs: np.ndarray, cfg: dict) -> dict:
+                           feats: dict, cfg: dict) -> dict:
+    from .extract_object_features import object_pair_similarity
     details, presence = [], []
     for rec in records:
         scheduled = [a for a in rec["appearances"] if a.get("scheduled", True)]
         n_sched = len(scheduled) + len(rec["missing_shots"])
         pres = len(scheduled) / n_sched if n_sched else None
         apps = [(a, prop_by_id[a["prop_id"]]) for a in rec["appearances"]
-                if prop_by_id[a["prop_id"]].dino_index is not None]
+                if prop_by_id[a["prop_id"]].prop_id in feats["dino"]]
+        props = [p for _, p in apps]
         stats = _pair_stats(
             [(a["shot"], a["kf_id"], a["prop_id"]) for a, _ in apps],
-            [dino_embs[p.dino_index] for _, p in apps],
-            cfg["object_match_threshold"])
+            [feats["dino"][p.prop_id] for p in props],
+            cfg["object_match_threshold"],
+            sim_fn=lambda i, j: object_pair_similarity(props[i], props[j], feats, cfg))
         presence.append(pres)
         details.append({"entity_id": rec["id"], "description": rec["description"],
                         "scheduled_shots": rec["scheduled_shots"],
@@ -105,6 +123,7 @@ def _prompt_object_metrics(records: list[dict], prop_by_id: dict[str, Proposal],
         "prompt_object_mean_similarity": _agg([d["object_similarity"]["mean"] for d in details]),
         "prompt_object_min_similarity": _agg([d["object_similarity"]["min"] for d in details]),
         "prompt_object_similarity_std": _agg([d["object_similarity"]["std"] for d in details]),
+        "prompt_object_centroid_similarity": _agg([d["object_similarity"]["centroid_mean"] for d in details]),
         "prompt_object_pass_rate": _agg([d["object_similarity"]["pass_rate"] for d in details]),
         "coverage": {"n_entities": len(records),
                      "n_comparable_pairs": sum(d["object_similarity"]["n_pairs"] for d in details)},
@@ -116,17 +135,22 @@ def _prompt_object_metrics(records: list[dict], prop_by_id: dict[str, Proposal],
 # group 2: model-emergent self-consistency
 # --------------------------------------------------------------------------
 def _emergent_metrics(emergent: dict, prop_by_id: dict[str, Proposal],
-                      dino_embs: np.ndarray, cfg: dict) -> dict:
-    def track_stats(tracks, get_emb, threshold):
+                      feats: dict, cfg: dict) -> dict:
+    from .extract_object_features import object_pair_similarity
+
+    def track_stats(tracks, get_emb, threshold, blended=False):
         details = []
         for t in tracks:
-            items, embs = [], []
+            items, embs, props = [], [], []
             for pid in t["prop_ids"]:
                 e = get_emb(prop_by_id[pid])
                 if e is not None:
                     items.append((prop_by_id[pid].shot_index, prop_by_id[pid].kf_id, pid))
                     embs.append(e)
-            stats = _pair_stats(items, embs, threshold)
+                    props.append(prop_by_id[pid])
+            sim_fn = (lambda i, j: object_pair_similarity(props[i], props[j], feats, cfg)) \
+                if blended else None
+            stats = _pair_stats(items, embs, threshold, sim_fn=sim_fn)
             details.append({"track_id": t["track_id"], "shots": t["shots"],
                             "labels": t["labels"], "n_members": len(t["prop_ids"]),
                             "similarity": stats})
@@ -138,8 +162,8 @@ def _emergent_metrics(emergent: dict, prop_by_id: dict[str, Proposal],
         cfg["face_match_threshold"])
     obj_details = track_stats(
         emergent["objects"],
-        lambda p: dino_embs[p.dino_index] if p.dino_index is not None else None,
-        cfg["object_match_threshold"])
+        lambda p: feats["dino"].get(p.prop_id),
+        cfg["object_match_threshold"], blended=True)
 
     n_char_clu = emergent["character_cluster_total"]
     n_obj_clu = emergent["object_cluster_total"]
@@ -150,6 +174,7 @@ def _emergent_metrics(emergent: dict, prop_by_id: dict[str, Proposal],
         "emergent_face_mean_similarity": _agg([d["similarity"]["mean"] for d in char_details]),
         "emergent_face_min_similarity": _agg([d["similarity"]["min"] for d in char_details]),
         "emergent_face_similarity_std": _agg([d["similarity"]["std"] for d in char_details]),
+        "emergent_face_centroid_similarity": _agg([d["similarity"]["centroid_mean"] for d in char_details]),
         "emergent_identity_fragmentation_rate":
             round(emergent["character_fragmentation_rate"], 4),
         "emergent_object_count": len(emergent["objects"]),
@@ -158,6 +183,7 @@ def _emergent_metrics(emergent: dict, prop_by_id: dict[str, Proposal],
         "emergent_object_mean_similarity": _agg([d["similarity"]["mean"] for d in obj_details]),
         "emergent_object_min_similarity": _agg([d["similarity"]["min"] for d in obj_details]),
         "emergent_object_similarity_std": _agg([d["similarity"]["std"] for d in obj_details]),
+        "emergent_object_centroid_similarity": _agg([d["similarity"]["centroid_mean"] for d in obj_details]),
         "emergent_object_fragmentation_rate":
             round(emergent["object_fragmentation_rate"], 4),
         "coverage": {"character_cluster_total": n_char_clu,
@@ -256,12 +282,12 @@ def _grouping_quality(groups: list[dict], keyframes: list[Keyframe],
 # entry point
 # --------------------------------------------------------------------------
 def evaluate_metrics(tracks: dict, proposals: list[Proposal], keyframes: list[Keyframe],
-                     dino_embs: np.ndarray, same_view: dict, scores: dict,
+                     feats: dict, same_view: dict, scores: dict,
                      view_labels: dict | None = None, cfg: dict = DEFAULTS) -> dict:
     prop_by_id = {p.prop_id: p for p in proposals}
     groups = same_view["groups"]
     char_m = _prompt_character_metrics(tracks["prompt"]["characters"], prop_by_id, cfg)
-    obj_m = _prompt_object_metrics(tracks["prompt"]["objects"], prop_by_id, dino_embs, cfg)
+    obj_m = _prompt_object_metrics(tracks["prompt"]["objects"], prop_by_id, feats, cfg)
     return {
         "prompt_specified": {
             **{k: v for k, v in char_m.items() if k not in ("coverage", "per_entity")},
@@ -270,7 +296,7 @@ def evaluate_metrics(tracks: dict, proposals: list[Proposal], keyframes: list[Ke
             "per_entity": {"characters": char_m["per_entity"],
                            "objects": obj_m["per_entity"]},
         },
-        "model_emergent": _emergent_metrics(tracks["emergent"], prop_by_id, dino_embs, cfg),
+        "model_emergent": _emergent_metrics(tracks["emergent"], prop_by_id, feats, cfg),
         "background_same_view": _background_metrics(groups, scores),
         "view_grouping_quality": _grouping_quality(groups, keyframes, view_labels),
         "config": {k: v for k, v in cfg.items()

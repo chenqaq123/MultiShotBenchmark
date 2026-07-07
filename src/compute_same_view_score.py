@@ -1,7 +1,7 @@
 """Steps 8.1–8.4: pairwise same-view scores between keyframes.
 
 same_view_score = 0.60 * S_dino_bg + 0.25 * S_depth + 0.15 * S_edge
-(the no-geometry variant of pipeline_plan §15.1), each component p5/p95
+(the no-geometry variant of pipeline_plan §14.1), each component p5/p95
 normalized within the episode. Frames with too little visible background
 are excluded (pipeline_plan §12.2).
 """

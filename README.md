@@ -57,7 +57,11 @@ difference, robust MAD normalization, cross-gap verification that rejects
 flash frames and chunked-generation seams). A config `shots` field is ignored.
 
 All thresholds live in `src/common.py::DEFAULTS` and are echoed into
-`metrics.json["config"]`. Metrics report coverage alongside similarity scores;
-dimensions with no comparable evidence come out as `null` with coverage 0 —
-no pass/fail verdicts (the `*_pass_rate` stats are parameterized by the
-documented thresholds, per pipeline_plan §9.5/§10.5).
+`metrics.json["config"]`. Metrics report coverage alongside similarity scores
+(pairwise + centroid); small-object similarity blends DINOv2 with an HSV
+color-histogram intersection; prompt association combines grounding score
+with embedding continuity across shots. Dimensions with no comparable
+evidence come out as `null` with coverage 0 — no pass/fail verdicts (the
+`*_pass_rate` stats are parameterized by the documented thresholds). The K
+lowest-consistency pairs per episode are materialized as side-by-side crop
+exhibits under `failure_cases/`.

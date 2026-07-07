@@ -9,10 +9,12 @@ from __future__ import annotations
 
 import numpy as np
 
-from .common import DEFAULTS
+from .common import DEFAULTS, Keyframe
 
 
-def cluster_same_view(scores: dict, cfg: dict = DEFAULTS) -> dict:
+def cluster_same_view(scores: dict, keyframes: list[Keyframe],
+                      cfg: dict = DEFAULTS) -> dict:
+    kf_by_id = {kf.kf_id: kf for kf in keyframes}
     ids = scores["kf_ids"]
     n = len(ids)
     combined = scores["combined"]
@@ -42,7 +44,13 @@ def cluster_same_view(scores: dict, cfg: dict = DEFAULTS) -> dict:
         if len(comp) > 1:
             sub = combined[np.ix_(comp, comp)]
             mean_sim = (sub.sum(axis=1) - 1.0) / (len(comp) - 1)
-            medoid = members[int(np.argmax(mean_sim))]
+            # medoid (pipeline_plan §15.3): among frames whose mean similarity is
+            # near the best, prefer high background visibility, then sharpness
+            floor = mean_sim.max() * cfg["medoid_tolerance"]
+            candidates = [m for m, s in zip(members, mean_sim) if s >= floor]
+            medoid = max(candidates,
+                         key=lambda k: (kf_by_id[k].bg_visible_ratio or 0.0,
+                                        kf_by_id[k].blur))
         else:
             medoid = members[0]
         groups.append({"group_id": f"view_{len(groups):02d}",

@@ -27,11 +27,11 @@ def color_histogram(bgr: np.ndarray) -> np.ndarray:
 
 
 def extract_object_features(proposals: list[Proposal],
-                            embeddings_dir: str | Path) -> tuple[np.ndarray, np.ndarray]:
-    """DINOv2 embedding for every person/object proposal crop.
+                            embeddings_dir: str | Path) -> dict:
+    """DINOv2 embedding + HSV color histogram for every person/object crop.
 
     Sets proposal.dino_index; saves matrices to embeddings/proposals.npz.
-    Returns (dino_embs [n,768], color_hists [n,1024]).
+    Returns feats = {"dino": {prop_id: vec}, "hist": {prop_id: vec}}.
     """
     targets = [p for p in proposals if p.kind in ("person", "object")]
     crops_rgb, hists = [], []
@@ -46,4 +46,23 @@ def extract_object_features(proposals: list[Proposal],
     np.savez_compressed(Path(embeddings_dir) / "proposals.npz",
                         prop_ids=np.array([p.prop_id for p in targets]),
                         dino=dino, color_hist=hists)
-    return dino, hists
+    return {"dino": {p.prop_id: dino[i] for i, p in enumerate(targets)},
+            "hist": {p.prop_id: hists[i] for i, p in enumerate(targets)}}
+
+
+def hist_intersection(h1: np.ndarray, h2: np.ndarray) -> float:
+    return float(np.minimum(h1, h2).sum())
+
+
+def object_pair_similarity(pa: Proposal, pb: Proposal, feats: dict,
+                           cfg: dict) -> float:
+    """DINOv2 cosine; for two small objects, blended with color-histogram
+    intersection (small crops carry little structure for DINOv2 alone)."""
+    from .common import cosine
+    s = cosine(feats["dino"][pa.prop_id], feats["dino"][pb.prop_id])
+    if (pa.area_ratio < cfg["small_object_area_ratio"]
+            and pb.area_ratio < cfg["small_object_area_ratio"]):
+        w = cfg["color_hist_weight"]
+        s = (1 - w) * s + w * hist_intersection(feats["hist"][pa.prop_id],
+                                                feats["hist"][pb.prop_id])
+    return s

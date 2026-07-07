@@ -27,6 +27,7 @@ from .common import DEFAULTS, ensure_dirs, load_episode_config, save_json
 from .compute_same_view_score import compute_same_view_scores
 from .detect_shots import detect_shots
 from .evaluate_metrics import evaluate_metrics
+from .export_failure_cases import export_failure_cases
 from .extract_background_features import extract_background_features
 from .extract_face_features import extract_face_features
 from .extract_keyframes import extract_keyframes
@@ -83,27 +84,30 @@ def run_episode(episode_cfg_path: str, output_dir: str, device: str | None = Non
     # Steps 6/7 features
     n_faces = extract_face_features(keyframes, proposals)
     log(f"faces attached to person proposals: {n_faces}")
-    dino_embs, _ = extract_object_features(proposals, dirs["embeddings"])
-    log(f"DINOv2 proposal embeddings: {dino_embs.shape}")
+    feats = extract_object_features(proposals, dirs["embeddings"])
+    log(f"DINOv2 proposal embeddings: {len(feats['dino'])}")
 
     # Step 5: association (prompt-specified + model-emergent tracks)
-    tracks = associate_entities(proposals, entities, dino_embs, cfg)
+    tracks = associate_entities(proposals, entities, feats, cfg)
     log(f"emergent tracks: chars={len(tracks['emergent']['characters'])}, "
         f"objs={len(tracks['emergent']['objects'])}")
 
     # Step 8: background features + same-view grouping
     bg_feats = extract_background_features(keyframes, dirs["masks"], dirs["embeddings"], cfg)
     scores = compute_same_view_scores(keyframes, bg_feats, cfg)
-    same_view = cluster_same_view(scores, cfg)
+    same_view = cluster_same_view(scores, keyframes, cfg)
     log(f"same-view groups: {len(same_view['groups'])} "
         f"(multi-frame={sum(g['size'] > 1 for g in same_view['groups'])}, "
         f"excluded kfs={len(same_view['excluded_kf_ids'])})")
 
     # Steps 9/10: metrics
-    metrics = evaluate_metrics(tracks, proposals, keyframes, dino_embs,
+    metrics = evaluate_metrics(tracks, proposals, keyframes, feats,
                                same_view, scores, ep.get("view_labels"), cfg)
     metrics["episode_id"] = ep.get("episode_id")
     metrics["video"] = ep["video"]
+
+    n_cases = export_failure_cases(metrics, proposals, dirs["failure_cases"], cfg)
+    log(f"failure-case exhibits exported: {n_cases}")
 
     # persist evidence
     save_json([asdict(p) for p in proposals], dirs["root"] / "proposals.json")

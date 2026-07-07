@@ -15,9 +15,9 @@ def _read_frame(cap: cv2.VideoCapture, idx: int) -> np.ndarray | None:
     return frame if ok else None
 
 
-def _quality(frame: np.ndarray) -> tuple[float, float]:
+def _quality(frame: np.ndarray) -> tuple[float, float, float]:
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    return laplacian_blur(gray), float(gray.mean())
+    return laplacian_blur(gray), float(gray.mean()), float(gray.std())
 
 
 def extract_keyframes(video_path: str, shots: list[Shot], out_dir: str | Path,
@@ -41,9 +41,11 @@ def extract_keyframes(video_path: str, shots: list[Shot], out_dir: str | Path,
                 frame = _read_frame(cap, idx)
                 if frame is None:
                     continue
-                blur, brightness = _quality(frame)
+                blur, brightness, contrast = _quality(frame)
                 if brightness < cfg["kf_min_brightness"] or brightness > cfg["kf_max_brightness"]:
                     continue  # black / white / fade frame
+                if contrast < cfg["kf_min_contrast"]:
+                    continue  # flat / washed-out frame
                 if blur > best_blur:
                     best, best_blur = (idx, frame, blur, brightness), blur
             if best is None:
@@ -67,7 +69,7 @@ def extract_keyframes(video_path: str, shots: list[Shot], out_dir: str | Path,
             center = shot.start_frame + n // 2
             frame = _read_frame(cap, center)
             if frame is not None:
-                blur, brightness = _quality(frame)
+                blur, brightness, _ = _quality(frame)
                 kf_id = f"s{shot.index:02d}_f{center:05d}"
                 path = out_dir / f"{kf_id}.png"
                 cv2.imwrite(str(path), frame)
