@@ -20,56 +20,56 @@
 
 我们将多镜头影视连续性定义为两种互补能力：
 
-1. **Prompt-grounded Continuity**：caption / shot prompt 中明确提到的人物、物体、状态和关系，应在相关镜头中被正确生成并跨镜保持稳定。它衡量模型能否遵守创作者明确给出的连续性约束。
-2. **Intrinsic Self-Consistency**：prompt 未明确规定、但模型在画面中自己建立的场景细节，一旦成为同一场景的一部分，也应在后续可比镜头中与自身保持自洽。它衡量模型能否维护自己生成出的场景世界。
+1. **Prompt-specified Continuity**：caption / shot prompt 中明确提到的人物、物体和地点，应在相关镜头中被正确生成并跨镜保持身份与外观稳定。它衡量模型能否遵守创作者明确给出的连续性约束。
+2. **Model-emergent Self-Consistency**：prompt 未明确规定、但模型自己生成并在多个镜头中复现的实体（配角、未指定的道具家具、墙面陈设等背景元素），以及模型建立的整体场景空间，应在后续可比镜头中与自身保持自洽。它衡量模型能否维护自己生成出的场景世界。
 
-这两者共同构成模型在影视创作中的连续性能力。前者对应剧本和分镜中明确要求的主体、关键道具与动作；后者对应观众在观看多镜头场景时自然建立的空间和环境记忆，例如灯、窗、墙画、沙发、整体光影和场景布局。
+这两者共同构成模型在影视创作中的连续性能力。前者对应剧本和分镜中明确要求的主体与关键道具；后者对应观众在观看多镜头场景时自然建立的角色、物体与空间记忆——模型自发引入的人物是否保持同一身份、自发生成的道具陈设是否稳定、同一视角下的背景结构是否自洽。
 
-### 2.2 输入设定：video + caption，全自动
+### 2.2 输入设定：video + caption，主流程自动
 
 Benchmark 的输入是：
 
 - 生成视频；
-- episode / shot-level caption；
-- 从 caption 中自动提取的主动提及主体列表（人物、物体、地点、动作状态和显式关系），作为 prompt-grounded track 的候选检查对象。
+- episode / shot-level caption（或 structured script），并附带镜头边界 / shot list；
+- prompt-specified entity list（人物、物体、地点），可从 caption / structured prompt 自动解析得到，也可由 structured script 直接给出，作为 prompt-specified track 的检查对象。
 
-我们不假设人工标注的 continuity contract，也不使用参考视频。评测过程完全自动。caption 只负责提供外部要求和镜头语义，模型自由生成出的额外场景信息则由评测器从视频中在线分析。
+我们不使用参考视频，也不依赖逐元素的人工 continuity contract。评测主流程由确定性视觉模块驱动、可自动运行；caption 只负责提供外部要求和镜头语义，模型自由生成出的额外实体与背景则由评测器从视频中在线检测、聚类和比较。评测器自身的质量（尤其是背景同视角分组）另用少量人工 pair 标注做验证，但这些标注不参与对生成模型的判分。
 
 ### 2.3 与普通 prompt-following 的区别
 
-Prompt-grounded continuity 不是简单的单镜头 prompt-following。它包含两个层次：
+Prompt-specified continuity 不是简单的单镜头 prompt-following。它包含两个层次：
 
 - **Shot realization / coverage**：caption 明确要求的主体或物体是否在应出现的镜头中被生成并可定位；
-- **Cross-shot stability**：这些已生成的 prompt-grounded elements 是否在多个镜头中保持外观、身份、状态和关系稳定。
+- **Cross-shot stability**：这些已生成的 prompt-specified elements 是否在多个镜头中保持身份和外观稳定。
 
-因此，"prompt 中要求蓝杯子但第一镜没有杯子"是 coverage / realization failure；"第一镜生成了蓝杯子，后续可比镜头变成白杯子"是 continuity failure。两者都重要，但需要分开报告，避免把 prompt-following 和跨镜连续性混成一个黑箱分数。
+因此，"prompt 中要求蓝杯子但第一镜没有杯子"是 coverage / realization failure；"第一镜生成了蓝杯子，后续镜头变成白杯子"是 continuity failure。两者都重要，但需要分开报告，避免把 prompt-following 和跨镜连续性混成一个黑箱分数。
 
 ## 3. Benchmark 定位与贡献
 
 本 benchmark 定位为：
 
-**一个面向多镜头生成视频的、仅凭 video+caption 的全自动场景连续性诊断 benchmark。**
+**一个面向多镜头生成视频的、以 video+caption 为主输入、对生成模型的诊断全自动的场景连续性 benchmark。**
 
 目标不是给模型一个笼统的 consistency score，而是像影视 continuity supervisor 一样，指出生成视频中具体哪里、哪个元素、在哪些镜头之间发生了穿帮。主要贡献包括：
 
-### 3.1 新任务：caption-only、全自动的双线连续性诊断
-已有评测大多关注主体一致性、单镜头 prompt-following，或依赖参考视频、逐元素标注和人工判分。我们把任务形式化为**只有 prompt 和生成视频、无人工介入**的多镜头连续性诊断，并明确区分两种能力：prompt-grounded continuity 与 intrinsic self-consistency。前者评估模型是否遵守显式创作约束，后者评估模型是否维护自己建立的场景世界。
+### 3.1 新任务：caption + video 的双线连续性诊断
+已有评测大多关注主体一致性、单镜头 prompt-following，或依赖参考视频。我们把任务形式化为**以 prompt 和生成视频为主输入**的多镜头连续性诊断，并明确区分两种能力：prompt-specified continuity 与 model-emergent self-consistency。前者评估模型是否遵守显式创作约束，后者评估模型是否维护自己建立的场景世界（自发实体与背景空间）。
 
-### 3.2 从 prompt-defined entities 到 generated scene evidence
-对 caption 中主动提到的主体和物体，我们借鉴 entity-centric benchmark 的做法：从 caption 提取候选实体，用 grounding、CLIP gate、crop embedding 和结构化 MLLM judge 进行定位与跨镜比较。对 prompt 未提到但模型自己生成的背景信息，我们不预先构造复杂标注，而是在每个生成视频中在线分析三类可检测证据：global state、salient objects 和 spatial layout。这样既覆盖显式剧本要求，也覆盖模型自发建立的场景记忆。
+### 3.2 从 prompt-specified entities 到 model-emergent entities 与背景空间
+对 caption 中主动提到的主体和物体，我们借鉴 entity-centric benchmark 的做法：从 caption 提取候选实体，用 open-vocabulary grounding、crop / face / object embedding 进行定位与跨镜比较。对 prompt 未提到但模型自己生成的元素，我们不预先构造复杂标注，而是在每个生成视频中在线做 open-world proposal 检测、跨镜聚类，得到 model-emergent tracks；同时对背景做前景剥离后的同视角分组，比较同视角下的背景一致性。这样既覆盖显式剧本要求，也覆盖模型自发建立的角色、物体与场景空间记忆。
 
-### 3.3 Hybrid evaluator：结构化 MLLM 判断 + 确定性聚合
-我们不把整段视频丢给 MLLM 直接打总分，而是将评测分解为可审计模块：shot 对齐、caption entity extraction、grounding、embedding comparison、view comparability grouping、global state / object / layout comparison。MLLM 用于结构化语义判断和 finding 解释，例如判断一个 crop 是否符合实体描述、两个实体是否为同一对象、某个场景变化是否构成连续性错误；最终分数由固定规则聚合。这避免了纯 MLLM judge 的黑箱性，同时保留其语义理解能力。
+### 3.3 分解式、可审计的确定性评测器
+我们不把整段视频丢给一个模型直接打总分，而是将评测分解为可审计的确定性模块：keyframe 抽取、prompt entity 解析、open-world proposal 检测与分割、前景/背景分离、实体关联、人脸 / 物体 embedding 比较、背景同视角分组与一致性计算。每个模块都产出可复现的中间证据（crops、masks、embeddings、tracks、same-view groups），最终分数由固定规则从这些证据聚合。整条流水线避免黑箱总分：任何一个分数都能回溯到具体的检测、embedding 相似度或分组结果。
 
 ### 3.4 Coverage × Correctness：抗空洞刷分的指标设计
-连续性评估有一个天然陷阱：画面越空洞、可比较元素越少，越不容易出现错误。我们因此不只报告 consistency accuracy，还报告 coverage / richness：模型生成了多少可检查的 prompt-grounded entities 和 intrinsic scene evidence。空洞视频 coverage 低，丰富但混乱的视频 correctness 低，只有"既可检查、又稳定"的生成结果才表现好。
+连续性评估有一个天然陷阱：画面越空洞、可比较元素越少，越不容易出现错误。我们因此不只报告 consistency，还报告 coverage / richness：模型生成了多少可检查的 prompt-specified entities、多少可复现的 model-emergent tracks，以及多少可比较的同视角背景对。空洞视频 coverage 低，丰富但混乱的视频 correctness 低，只有"既可检查、又稳定"的生成结果才表现好。
 
-### 3.5 无人工的可信度验证：受控扰动标定
-既然没有人当裁判，指标的可信度靠**构造已知答案**自证：对自洽片段程序化注入已知漂移（改色、删道具、换脸、平移家具），要求对应分数单调下降，并测其检出率。这把每个分数从"经验阈值"变成"被验证的判据"，也把"如何认证一个自动视频连续性指标"本身作为方法贡献。
+### 3.5 评测器可信度验证：同视角分组质量自检
+评测中风险最高的一环是背景**同视角分组**——分组错误会直接污染背景一致性分数。我们因此把分组质量本身作为被验证对象：用少量人工 pair 标注（same-view / different-view）计算 pairwise precision / recall / F1，并报告 over-merge 与 over-split 率和 view confusion matrix。这让"背景一致性分数是否可信"成为可度量、可报告的量，且这部分标注只用于评测器自检，不参与对生成模型的评分。
 
 ## 4. 数据构造流程
 
-真实影视视频提供多镜头结构和连续性压力，但不直接作为 ground truth。发布的是原创 episode 的 **prompt(caption) + 生成视频 + 自动诊断结果**，外加一个**独立的扰动验证集**（用于标定评测器，非 benchmark 主数据）。
+真实影视视频提供多镜头结构和连续性压力，但不直接作为 ground truth。发布的是原创 episode 的 **prompt(caption) + 镜头边界 + 生成视频 + 自动诊断结果**，外加用于评测器自检的**少量同视角 pair 标注**（用于验证背景分组质量，非 benchmark 主数据）。
 
 整体流程：
 
@@ -77,8 +77,9 @@ Prompt-grounded continuity 不是简单的单镜头 prompt-following。它包含
 → 镜头结构与连续性压力点挖掘
 → 抽象改写为原创 episode 的 shot-level prompt
 → 输入生成模型得到多镜头视频
-→ 自动提取 prompt-grounded entities 与 intrinsic scene evidence
-→ 全自动诊断 continuity errors
+→ 解析 prompt-specified entities、检测 model-emergent proposals、剥离前景/背景
+→ 关联实体、人脸/物体 embedding 比较、背景同视角分组与一致性
+→ 输出各线连续性分数与元素级明细
 
 ### 4.1 从真实叙事视频中挖掘结构
 真实影视剧、短片、广告中天然存在同场景多镜头叙事（远景建立、近景刻画、特写道具、正反打、插入、遮挡后重现、道具交接、回到远景）。我们挖掘的不是具体人物或画面，而是**多镜头组织方式和连续性压力点**。
@@ -87,100 +88,102 @@ Prompt-grounded continuity 不是简单的单镜头 prompt-following。它包含
 为避免版权问题，真实视频只作结构来源。我们替换具体人物、地点、物体和情节，但保留其连续性挑战，写成 shot-level prompt。我们不发布人工逐元素 continuity contract；prompt 中主动提到的主体列表由评测器自动抽取，prompt 之外的场景细节由生成结果本身提供证据。
 
 ### 4.3 生成并诊断
-将 episode prompt 输入不同视频生成模型，收集生成视频，按 §7 全自动诊断。最终发布数据：
-- 原创 episode 的 shot-level prompt；
+将 episode prompt 输入不同视频生成模型，收集生成视频，按 §7 自动诊断。最终发布数据：
+- 原创 episode 的 shot-level prompt 与镜头边界；
 - 各模型生成视频；
-- 自动抽取的 prompt-grounded entity list（用于审计，可重现生成）；
-- 自动诊断结果与分数；
+- prompt-specified entity list（用于审计，可重现生成）；
+- 自动诊断结果与分数（含 entity tracks、same-view groups 与各维度指标）；
 - 评测代码与指标；
-- 独立的扰动验证集（自动带标签，用于评测器标定）。
+- 用于同视角分组质量自检的少量人工 pair 标注。
 
 ## 5. Episode 组织
 
 每个 episode 是同一场景内的短多镜头叙事，通常 4–8 个镜头。每个 episode 包含两部分输入，以及一个评测时自动产生的审计产物：
 
 ### 5.1 Shot-level Prompt
-逐镜描述内容、动作、视角、镜头类型与时长。它定义模型要生成什么，也是评测时做 shot 对齐和提取 prompt-grounded entities 的文本依据。
+逐镜描述内容、动作、视角、镜头类型与时长。它定义模型要生成什么，也是评测时做 shot 对齐和解析 prompt-specified entities 的文本依据。
 
 ### 5.2 Evaluation Target（可选、仅供分析分组）
-标注该 episode 主要制造的连续性压力（主体持续 / 道具重现 / 背景稳定 / 状态保持 / 空间关系 / 光影氛围），仅用于结果分层分析，不参与判分、不作为标准答案。
+标注该 episode 主要制造的连续性压力（主体持续 / 道具重现 / 背景稳定 / 空间关系 / 自发实体复现），仅用于结果分层分析，不参与判分、不作为标准答案。
 
-### 5.3 Auto-extracted Prompt Entity List（评测产物）
-评测器从 shot-level prompt 中自动抽取主动提到的 characters、objects、locations、actions 和显式 relations。它不是人工标注，也不是 hidden answer，而是为了让 prompt-grounded continuity 的检查对象可审计、可复现。
+### 5.3 Prompt-specified Entity List（评测产物）
+评测器从 shot-level prompt / structured script 中抽取主动提到的 characters、objects 和 locations（含各自的 scheduled shots）。它不是 hidden answer，而是为了让 prompt-specified continuity 的检查对象可审计、可复现；每个实体记录其应出现的镜头，用于判断 presence 与跨镜一致性。
 
-## 6. 连续性错误类型
+## 6. 连续性漂移类型
 
-第一版定义五类核心 continuity errors。它们可以发生在 prompt-grounded track，也可以发生在 intrinsic track：
+第一版定义分数所刻画的连续性漂移维度（低分对应下述现象），按三条评测线组织。它们用于解释各维度分数的含义与结果分层，benchmark 只报告连续分数、不对是否"构成错误"下判定：
 
-- **Missing**：应持续存在的元素在后续镜头中消失。
-- **Appearance Drift**：元素外观无理由变化（颜色、形状、材质、服装、图案、身份漂移）。
-- **State Drift**：元素状态不连续（已拿起的道具无理由回到桌上等）。
-- **Spatial Drift**：元素位置或相对关系不合理变化（门、窗、桌、沙发、墙画等空间关系不自洽）。
-- **Lighting / Atmosphere Drift**：光源方向、色温、亮度、时间氛围突变。
+**Prompt-specified track**
+- **Missing**：prompt 指定的人物 / 物体在其 scheduled shot 中缺失。
+- **Identity Drift**：prompt 指定的人物在多镜之间身份漂移（人脸 embedding 不一致）。
+- **Appearance Drift**：prompt 指定的物体外观无理由变化（颜色、形状、材质、图案）。
+- **Background / Location Drift**：prompt 指定的地点或背景发生漂移。
 
-## 7. 评测方法（双线、分解式、可复现流水线）
+**Model-emergent track**
+- **Emergent Identity Instability**：模型自发生成的配角身份不稳定。
+- **Emergent Object Drift**：模型自发生成的物体 / 道具反复变化或消失。
+- **Track Fragmentation / Merge**：同一视觉元素被拆成多个 emergent track，或不同元素被错误合并为同一 track。
 
-评测器判断生成视频是否同时满足外部 prompt-grounded continuity 和内部 self-consistency。整体流程全部自动；视觉模块提供可复现证据，MLLM 提供结构化语义判断和诊断解释，最终分数由确定性规则聚合。（完整算法、参数与分数公式见配套 `pipeline_plan.md`，此处为方法概述。）
+**Same-view background track**
+- **Same-view Background Drift**：同一视角组内背景结构 / 布局 / 外观不自洽。
+- **View Over-merge / Over-split**：不同视角被错误合并，或同一视角因生成细节漂移被错误拆分。
 
-### 7.1 Stage 1 — Shot 检测与关键帧
-经典内容差分法（HSV 直方图卡方距离 + 自适应阈值）切分镜头。实测发现 AI 生成视频常把分镜渲成**连续运镜**，纯差分对硬切可靠、对软分镜漏检、对快速运镜误检；因此采用 **prompt-anchored 对齐**：把检测峰吸附到 prompt 声明的分镜时间点。每个 shot 取"清晰度−运动"最优的中段帧为关键帧，避开运动模糊。
+## 7. 评测方法（三线、分解式、可复现流水线）
 
-### 7.2 Stage 2 — Prompt-grounded entity extraction 与 grounding
-从每镜 prompt 解析主动提到的实体及 referring expression，用 GroundingDINO / open-vocabulary detector 定位，并用 CLIP gate 与 crop quality gate 选择 canonical crop。对人物和物体计算 DINOv2 / 人脸 embedding；对动作可构造多帧 annotated grid。MLLM 以结构化 JSON 判断 crop 是否符合实体描述、动作是否被正确呈现。该阶段输出 prompt-grounded coverage 与后续跨镜比较所需的证据。
+评测器沿三条线判断生成视频：prompt-specified 实体一致性、model-emergent 自一致性、同视角背景一致性。整条流水线全部由确定性视觉模块驱动，每个阶段产出可复现证据，最终分数由固定规则聚合。（完整算法、参数与分数公式见配套 `pipeline_plan.md`，此处为方法概述。）
 
-### 7.3 Stage 3 — Intrinsic scene evidence 与视角可比性
-对 prompt 未显式指定但模型自己生成的场景信息，评测器不试图枚举所有背景细节，而只检查三类普适且可检测的证据：
+### 7.1 Stage 1 — Shot 关键帧抽取
+在给定镜头边界 / shot list 上，对每个 shot 抽取代表性关键帧（中段帧，必要时加首/尾稳定帧）。用 Laplacian 清晰度、亮度/对比度、前景与背景可见比例过滤转场帧、严重运动模糊、黑/白/fade 帧和主体几乎不可见的帧。
 
-- **Global State**：风格、光影、时间、天气、整体氛围；
-- **Salient Objects**：显著背景物体和陈设；
-- **Spatial Layout**：粗空间结构和相对关系。
+### 7.2 Stage 2 — Prompt-specified entity 解析与关联
+从 shot-level prompt / structured script 解析 characters、objects、locations 及其 scheduled shots，用 open-vocabulary detector（如 GroundingDINO）在关键帧中定位，用 crop / face / object embedding 相似度将 proposal 关联到对应 prompt 实体。scheduled shot 中未匹配到的实体记为 missing，构成 prompt-specified coverage。
 
-为了避免正常机位变化造成误判，先进行 view / comparable-shot grouping：融合全图/背景 embedding、局部特征匹配、RANSAC 几何验证、大结构 anchor 分布；几何证据弱时可用 MLLM 判断可比性，但必须输出结构化原因。后续强比较只在可比视角组内进行。
+### 7.3 Stage 3 — Open-world proposal 与前景/背景分离
+除 prompt 实体外，对每个关键帧做 open-world 检测 / 分割（GroundingDINO / YOLO / RT-DETR + SAM / Mask2Former），得到 person / face / object / 显著背景区域 proposals，并按面积、置信度、清晰度、重复度过滤。合并前景实体的 mask 得到 foreground mask，其补集为 background mask，并记录 background visible ratio，供背景特征的 masked pooling 使用。
 
-### 7.4 Stage 4 — 跨镜头连续性比较
-两条 track 共享"只在可检查机会中比较"的原则：
+### 7.4 Stage 4 — 实体关联与 model-emergent tracks
+未被分配给任何 prompt 实体的 proposal 进入 model-emergent pool，通过 embedding 跨镜聚类形成 emergent tracks（要求至少在两个 shot / 多个关键帧出现、embedding 相似度足够高、类型一致）。这样区分"模型遵守 prompt 的实体"与"模型自发建立并需自洽的实体"。
 
-- **Prompt-grounded track**：对 caption 主动提到的实体比较 presence、identity、appearance、state、action 和显式 relations。DINOv2 / ArcFace / attribute comparison 给出可计算分数，MLLM 只输出结构化 fidelity / consistency judgment。
-- **Intrinsic track**：在可比视角组内比较 global state 的分类与统计、salient objects 的存在/属性/位置、spatial layout 的粗关系图。缺乏可比证据时标记为 unverified，不直接判错。
+### 7.5 Stage 5 — 人物与物体一致性
+- **人物**：对 person crop 做人脸检测 / 对齐（RetinaFace / SCRFD）、ArcFace / InsightFace embedding，计算 track 内 pairwise 与 centroid 人脸相似度；分别输出 prompt-specified 与 emergent 的 presence / detection / 身份一致性指标。
+- **物体**：对 object crop 提取 DINOv2 crop / patch embedding（小物体辅以颜色直方图、形状描述、mask 面积比），计算 track 内相似度；分别输出 prompt-specified 与 emergent 的 presence / 外观一致性指标。
 
-### 7.5 Stage 5 — 汇总与 typed findings
-把各分数汇总为分维度与总体分数，并输出元素级、类型化、可定位的 finding：`{element, error_type, affected_shots, evidence(分数与观测), confidence, severity}`。这正是 benchmark 的诊断价值所在。
+### 7.6 Stage 6 — 背景同视角分组
+为避免正常机位变化造成误判，先做同视角分组：对 background mask 下的 DINOv2 patch 做 masked pooling 得背景特征，融合 depth layout 与 edge layout 相似度、可选的弱几何信号（SuperPoint+LightGlue / LoFTR + RANSAC），按固定权重加权归一化为 same-view score，再用 mutual-kNN 图聚类成 same-view groups。背景可见比例过低的帧不强行参与分组。
+
+### 7.7 Stage 7 — 同视角背景一致性与分组质量
+在每个 same-view group 内计算背景 embedding、depth、edge 的组内一致性，并按组内 pair 数加权汇总为 episode 级同视角一致性。同时用 view confusion matrix 与少量人工 pair 标注评估分组质量（pairwise P/R/F1、over-merge / over-split 率），作为背景一致性可信度的自检。
+
+### 7.8 Stage 8 — 汇总与分数明细
+把各线的 embedding 相似度、presence / recurrence、组内一致性等汇总为分维度分数（见 §8），并给出元素级、可定位的分数明细：`{element/track, comparison_type, shot_pairs, similarity_scores}`——每个 prompt 实体 / emergent track / same-view group 在各镜头对上的一致性分数，以及分数最低的镜头对。这样 benchmark 不仅给出总体分数，还能定位到具体元素与镜头供分析，但只报告分数，不做 pass/fail 判定。
 
 ## 8. 指标设计
 
-### 8.1 四个主维度：Coverage × Correctness
+### 8.1 四组指标：Coverage × Correctness，不混为单一总分
 
-我们优先报告四个主维度，而不是只报一个黑箱总分：
+我们报告四组指标，而非一个黑箱总分：
 
-- **Prompt-grounded Coverage**：caption 主动提到的实体、动作和关系中，有多少被生成并可检查；
-- **Prompt-grounded Consistency**：可检查的 prompt-grounded elements 中，有多少跨镜保持稳定；
-- **Intrinsic Scene Richness / Coverage**：模型自己生成出多少可检测、可比较的 global state / salient objects / spatial layout evidence；
-- **Intrinsic Self-Consistency**：这些 intrinsic scene evidence 在可比镜头中有多少保持稳定。
+- **Prompt-specified entity consistency**：prompt_character_presence_rate、prompt_face_mean_similarity、prompt_face_min_similarity、prompt_object_presence_rate、prompt_object_mean_similarity、prompt_object_min_similarity。衡量 prompt 要求的人 / 物是否出现且跨镜保持身份与外观。
+- **Model-emergent self-consistency**：emergent_character_count / recurrence_rate / face_mean_similarity、emergent_object_count / recurrence_rate / object_mean_similarity，以及 identity / object fragmentation rate。衡量模型自发实体是否在多镜中自洽。
+- **Background same-view consistency**：same_view_group_count、average_same_view_group_size、intra_group_bg / depth / edge similarity、episode_same_view_consistency。衡量同视角下背景是否稳定。
+- **View grouping quality**：pairwise precision / recall / F1、over-merge / over-split 率、view confusion matrix。衡量分组本身是否可信。
 
-这四项共同避免两种错误激励：只生成空洞画面以逃避错误，或只遵守 prompt 中主体但背景世界不断漂移。
+其中 presence rate、count、recurrence rate、group size 等构成 coverage / richness，similarity / pass rate 构成 correctness。这样既避免"只生成空洞画面逃避错误"，也避免"只守住 prompt 主体而自发背景不断漂移"。
 
-### 8.2 Scene Continuity Score（按机会数归一化的标量主指标）
-需要单一排序时，用**机会数归一化**汇总，避免不同富度不可比：
-```
-SCS = Σ_c (w_c · score_c · opp_c) / Σ_c (w_c · opp_c)
-opp_c = 该维度的可比较机会数（实体出现的 shot 对数、同视角组内帧对数等）
-```
-其中 `c` 覆盖 prompt-grounded 与 intrinsic 两条 track。分项包括 Subject / Face、Prompted Object、Action / State、Global State、Salient Object、Spatial Layout。我们同时报告 `opp_c` 或 coverage，避免模型通过减少可比较内容获得虚高 consistency。
+### 8.2 分数的分层报告
+除总体分数外，按元素类型（人物 / 物体 / 背景）、按 track（prompt-specified / model-emergent）、按镜头结构分别报告一致性分数分布，并报告 fragmentation / merge 与 over-merge / over-split 等结构性统计。用于揭示模型是易丢道具、易破坏空间关系，还是在特定镜头结构中一致性更低——全部以连续分数与统计量呈现，不设错误判定阈值。
 
-### 8.3 诊断型指标
-体现诊断能力：每 episode 的 continuity error 数、每类错误频率、每类元素错误率、不同镜头结构下的错误率、major error rate。用于揭示模型是易丢道具、易破坏空间关系，还是在特定镜头结构中更易失败。
-
-### 8.4 MLLM 可靠性与受控扰动验证
-MLLM 不直接产生最终总分，而是输出结构化判断与 findings。其可靠性通过两种方式约束：一是与非 MLLM evidence 一起进入确定性聚合，二是在受控扰动验证集上检查分数单调性与 finding 定位。扰动包括改色、删道具、换脸、平移家具、改变光影或布局；报告每类分数的检出率、误报率、定位准确率，以及阈值 τ 的 ROC 拐点。
+### 8.3 只报分数，不做检测判定
+本 benchmark 输出连续分数（embedding 相似度、presence / recurrence rate、组内一致性等），可复现、可审计；它不设 pass/fail 阈值、不把生成结果判为"有错 / 无错"——如何据分数排序或设线，留给使用者按需应用。评测中风险最高的同视角分组另用少量人工 pair 标注做 pairwise P/R/F1 与 over-merge / over-split 自检；缺乏可比证据（背景可见比例过低、无同视角对）的维度直接报为无可比机会（coverage=0），不计入一致性分数。
 
 ## 9. 缓解方法（辅助实验）
 
-建议包含一个简单 baseline：**Continuity Memory Prompting**——生成后续镜头时显式维护一个 scene continuity memory，记录前文需保持的元素、属性、状态、空间关系与光影，作为约束加入后续 prompt。其作用不是提出新模型，而是验证 benchmark 能否指导改进：哪些错误可被显式记忆减少、哪些仍难缓解、失败究竟来自记忆不足、空间建模不足还是细粒度视觉控制不足。预期它对主体和显著道具有帮助，但对复杂背景陈设、空间布局、光影连续提升有限——进一步说明本 benchmark 暴露的是当前模型尚未解决的深层问题。
+建议包含一个简单 baseline：**Continuity Memory Prompting**——生成后续镜头时显式维护一个 scene continuity memory，记录前文需保持的实体、属性与空间结构，作为约束加入后续 prompt。其作用不是提出新模型，而是验证 benchmark 能否指导改进：哪些错误可被显式记忆减少、哪些仍难缓解、失败究竟来自记忆不足、空间建模不足还是细粒度视觉控制不足。预期它对 prompt 指定的主体和显著道具有帮助，但对模型自发实体的自洽和复杂背景的同视角连续提升有限——进一步说明本 benchmark 暴露的是当前模型尚未解决的深层问题。
 
 ## 10. 总结
 
-真实影视中同一场景往往包含较长的多镜头叙事，天然要求人物、道具、背景、空间和光影在剪辑之间保持连续。随着视频生成走向多镜头叙事，仅评估主体一致性已不够。
+真实影视中同一场景往往包含较长的多镜头叙事，天然要求人物、道具、背景和空间在剪辑之间保持连续。随着视频生成走向多镜头叙事，仅评估主体一致性已不够。
 
-我们提出一个**仅凭 video 与 caption、全自动**的多镜头场景连续性诊断 benchmark：从真实叙事视频挖掘多镜头连续性压力，抽象为原创 episode 的 shot-level prompt；沿 prompt-grounded continuity 与 intrinsic self-consistency 两条线诊断生成视频中的 continuity errors，输出元素级、类型化 findings；用 coverage × correctness 的指标设计抗空洞刷分，用受控扰动在无人工条件下标定指标可信度。
+我们提出一个**以 video 与 caption 为主输入**的多镜头场景连续性诊断 benchmark：从真实叙事视频挖掘多镜头连续性压力，抽象为原创 episode 的 shot-level prompt；用分解式、确定性的视觉流水线（检测、分割、人脸/物体 embedding、背景同视角分组），沿 prompt-specified continuity、model-emergent self-consistency、same-view background consistency 报告生成视频的连续性分数，并给出元素级、可定位的分数明细；用 coverage × correctness 的指标设计抗空洞刷分，用同视角分组质量自检约束背景一致性的可信度。整条流水线只输出连续分数、不设 pass/fail 阈值。
 
 最终，本 benchmark 把多镜头视频评测从"主体是否一致"推进到"整个场景是否像真实影视一样，同时遵守创作者要求并维护自身建立的场景世界"。

@@ -1,489 +1,974 @@
-# 多镜头视频场景连续性评测流水线
+# Pipeline Plan: Multi-shot 生成视频中的实体一致性与同视角背景分组
 
-本文档对应 `proposal.md` 的落地方案。目标是保持评测框架清晰：输入只有生成视频与 shot-level caption；评测分为 **Prompt-grounded Continuity** 和 **Intrinsic Self-Consistency** 两条线；MLLM 用于结构化语义判断和诊断解释，最终分数由确定性规则聚合。
+## 1. 目标
 
----
+本 pipeline 面向 multi-shot 生成视频，核心目标是评估视频中实体和背景在多个 shot 之间的一致性。
 
-## 0. 输入与输出
+需要区分两类一致性对象：
 
-### 输入
+1. **Prompt-specified entities**  
+   prompt 中明确指定的主体、人物、物体、地点或背景元素。
 
-- `video`: 一个 episode 的多镜头生成视频，或多个已切分 shot video。
-- `captions`: episode / shot-level prompt，包含每个镜头的内容、动作、视角、镜头类型与时长。
+2. **Model-emergent entities**  
+   prompt 中没有明确指定，但模型自己生成并在多个 shot 中重复出现的实体、物体、背景结构或视觉细节。
 
-### 输出
-
-- `prompt_entities.json`: 从 caption 自动抽取的主动提及主体列表，用于审计。
-- `shot_table.json`: shot 边界、关键帧、可比视角组。
-- `scores.json`: coverage / consistency / SCS 等分数。
-- `findings.json`: 元素级、类型化、可定位的 continuity findings。
-- 可选 audit artifacts：canonical crops、关键帧、视角组可视化、MLLM JSON response。
+二者需要在同一套流程中处理，但指标上需要区分，不能混为一个总分。
 
 ---
 
-## 1. 总体框架
+## 2. 输入与输出
 
-```
-video + shot captions
-        |
-Shot alignment and keyframes
-        |
-Caption entity extraction
-        |
-+---------------------------+     +-----------------------------+
-| Prompt-grounded track     |     | Intrinsic scene track       |
-| caption 主动提到的元素     |     | 模型自己建立的场景信息       |
-+---------------------------+     +-----------------------------+
-        |                                   |
-Grounding / crop / embedding        View grouping / scene evidence
-        |                                   |
-Structured MLLM judgment            Global / object / layout comparison
-        |                                   |
-        +---------------+-------------------+
-                        |
-       deterministic aggregation + typed findings
+### 2.1 输入
+
+```text
+Input:
+- multi-shot generated video
+- shot boundary / shot list
+- prompt or structured script
+- prompt-specified entity list, if available
 ```
 
-两个 track 共享三个原则：
+其中 prompt-specified entity list 可以来自人工标注、structured prompt，或从 prompt 中解析得到。
 
-1. **先建立可检查机会，再判断错误**：没有足够视觉证据时标记为 `unverified`，不直接记为错误。
-2. **分开报告 coverage 与 correctness**：避免空背景、低细节视频靠"无可检查内容"获得高分。
-3. **MLLM 不直接给总分**：MLLM 输出结构化 JSON，最终分数由固定公式计算。
+### 2.2 输出
+
+```text
+Output:
+- shot-level keyframes
+- foreground / background masks
+- character / object / background crops or regions
+- prompt-specified entity consistency metrics
+- model-emergent self-consistency metrics
+- same-view background groups
+- same-view background consistency metrics
+- view confusion matrix
+```
 
 ---
 
-## 2. Stage 1 — Shot 对齐与关键帧
+## 3. 总体流程
 
-### 2.1 Shot 对齐
+```text
+Multi-shot generated video
+→ shot-level keyframe extraction
+→ prompt-specified entity parsing
+→ open-world proposal extraction
+→ foreground / background separation
+→ entity association
 
-优先使用 caption 中的分镜结构。如果模型输出为多个 shot video，直接使用边界；如果输出为连续视频，则结合内容差分与 prompt-anchored alignment。
-
-推荐实现：
-
-```
-1. HSV histogram / PySceneDetect 检测候选边界。
-2. 根据 caption 声明的 shot 数、时长或顺序做最近邻 / DTW 对齐。
-3. 对快速运镜导致的伪切进行最小镜头长度与光流平滑过滤。
-```
-
-AI 生成视频经常把分镜渲成连续运镜，所以纯 shot boundary detection 不可靠。prompt-anchored alignment 的作用不是提供连续性答案，而是保证后续评测按同一组 shot 进行。
-
-### 2.2 关键帧采样
-
-每个 shot 采样 3-6 帧，覆盖开头、中段、结尾。用于实体 grounding 的 canonical frame 由清晰度和运动幅度共同选择：
-
-```
-score(f) = sharpness(f) - lambda * motion(f)
-sharpness = var(Laplacian(gray))
-motion = mean |f_t - f_{t-1}| 或光流幅度
+→ character consistency evaluation
+→ object consistency evaluation
+→ background same-view grouping
+→ same-view background consistency evaluation
+→ final metrics and confusion analysis
 ```
 
-输出：
+这里的关键是：  
+prompt 指定实体和模型自发实体共享检测、分割、特征提取和聚类模块，但在指标汇总时分开统计。
+
+---
+
+## 4. Step 1: Shot-level Keyframe Extraction
+
+### 4.1 目的
+
+从每个 shot 中抽取代表性关键帧，用于后续实体检测、特征提取、背景分组和一致性计算。
+
+### 4.2 推荐做法
+
+每个 shot 至少抽取一个中间关键帧：
+
+```text
+keyframe_s = middle_frame(shot_s)
+```
+
+如果需要增强鲁棒性，可以从每个 shot 抽取：
+
+```text
+- first stable frame
+- middle frame
+- last stable frame
+```
+
+### 4.3 低质量帧过滤
+
+过滤以下帧：
+
+```text
+- 转场帧
+- 严重 motion blur
+- 黑屏 / 白屏 / fade frame
+- 主体或背景几乎不可见的帧
+```
+
+可用过滤信号：
+
+```text
+- Laplacian blur score
+- brightness / contrast
+- foreground visible ratio
+- background visible ratio
+```
+
+---
+
+## 5. Step 2: Prompt-specified Entity Parsing
+
+### 5.1 目的
+
+从 prompt 或 structured script 中得到明确需要评估的实体。
+
+### 5.2 实体类型
+
+```text
+- character / person
+- object
+- background / location
+```
+
+### 5.3 结构化表示
 
 ```json
 {
-  "shot_id": "S03",
-  "time_range": [8.0, 11.0],
-  "caption": "...",
-  "keyframes": ["S03_f1.png", "S03_f2.png", "S03_f3.png"]
-}
-```
-
----
-
-## 3. Stage 2 — Prompt-Grounded Continuity
-
-这条线评估 caption 主动提到的主体、物体、地点、动作状态和显式关系。它学习 EntityBench 的经验，但目标从 entity consistency 扩展到 continuity diagnosis。
-
-### 3.1 Caption Entity Extraction
-
-从 shot-level caption 自动抽取：
-
-- `characters`: 人物及稳定描述，如外观、服装、身份标签；
-- `objects`: 关键道具和被交互物；
-- `locations`: 明确地点或场景区域；
-- `actions/states`: 拿起、放下、递交、坐下、站立等状态变化；
-- `relations`: A beside B, object on table, person left of person 等显式关系。
-
-可以用规则 + LLM 解析，但输出必须是结构化、可审计 JSON：
-
-```json
-{
-  "shot_id": "S02",
   "characters": [
     {
-      "id": "woman_1",
-      "description": "woman in a beige cardigan",
-      "expected_visibility": "visible"
+      "id": "char_01",
+      "description": "the main character specified in the prompt",
+      "scheduled_shots": [1, 2, 4]
     }
   ],
   "objects": [
     {
-      "id": "mug_1",
-      "description": "blue ceramic mug",
-      "state": "on the table"
+      "id": "obj_01",
+      "description": "the object specified in the prompt",
+      "scheduled_shots": [2, 3]
     }
   ],
-  "relations": [
-    {"subject": "mug_1", "relation": "on", "object": "table"}
+  "backgrounds": [
+    {
+      "id": "bg_01",
+      "description": "the location or background specified in the prompt",
+      "scheduled_shots": [1, 2, 3, 4]
+    }
   ]
 }
 ```
 
-这里的 entity list 来自 caption，不是人工 continuity contract。它只定义 prompt-grounded track 的候选对象。
+### 5.4 作用
 
-### 3.2 Grounding 与 Canonical Evidence
+这一部分只负责建立 prompt-specified entity list。  
+它用于后续判断：
 
-对每个 prompt entity，在对应 shot 的 sampled frames 中定位：
-
-- open-vocabulary detector：GroundingDINO / OWL-ViT；
-- CLIP text-image similarity gate；
-- crop quality gate：面积、清晰度、遮挡程度；
-- 人物可加 face detector / ArcFace；
-- 动作用 annotated multi-frame grid。
-
-canonical crop 的选择可以采用：
-
+```text
+- prompt 指定的实体是否出现
+- prompt 指定的实体是否跨 shot 保持一致
 ```
-selection = detector_confidence * clip_similarity * sharpness_score * area_score
-```
-
-输出每个 `(shot, entity)` 的三态：
-
-- `present`: 检出且通过 CLIP / quality gate；
-- `weak`: 有候选但置信度不足，可供 MLLM 审计；
-- `absent`: 未检出或无可用证据。
-
-### 3.3 Prompt-Grounded 分数
-
-**Coverage**
-
-```
-PG-Coverage = # present prompt entity slots / # scheduled prompt entity slots
-```
-
-按 character / object / location / action 分开报告。
-
-**Entity Fidelity**
-
-对 canonical crop 与 caption description 做结构化 MLLM 判断，输出 1-10 并归一化到 `[0,1]`。criteria 可采用类型化 rubric：
-
-- character: face / hair / clothing / build
-- object: shape / color_texture / proportions / details
-- location: layout / color_mood / landmarks / perspective
-
-**Cross-shot Consistency**
-
-对跨多个 shot 出现的 prompt entity：
-
-```
-emb_{e,i} = DINOv2(crop_{e,i})
-centroid_e = normalize(mean_i emb_{e,i})
-CS_emb(e) = mean_i cos(emb_{e,i}, centroid_e)
-```
-
-人物身份可另算：
-
-```
-CS_face(p) = mean_{i<j} cos(ArcFace(face_{p,i}), ArcFace(face_{p,j}))
-```
-
-MLLM 可做 anchor-vs-each 或 set-based structured judge，输出：
-
-```json
-{
-  "is_same": true,
-  "similarity": 8,
-  "criteria": {"clothing": 7, "face": 9},
-  "reason": "..."
-}
-```
-
-最终分数使用固定聚合，而不是 MLLM 总分。
-
-**Prompt-Grounded Consistency**
-
-```
-PG-Consistency =
-  weighted_mean(CS_emb, CS_face, state_consistency, relation_consistency)
-```
-
-只在可检查机会中计算；低 fidelity 的错误 crop 可 gate out，避免"错误但一致"获得高分。
 
 ---
 
-## 4. Stage 3 — Intrinsic Self-Consistency
+## 6. Step 3: Open-world Proposal Extraction
 
-这条线评估模型自己建立的场景世界。我们不为每个 case 提前构造复杂 registry，也不试图追踪所有背景细节。每个生成视频在线处理，只检查三类普适且可检测的证据。
+### 6.1 目的
 
-### 4.1 可检测范围
+除了 prompt 指定实体，还需要发现模型自己生成的实体和视觉元素。
 
-**Global State**
+这些元素不来自 prompt，但可能在多个 shot 中重复出现，例如：
 
-- 风格：真人、动漫、3D、插画、油画感等；
-- 光影：暖光/冷光、明亮/昏暗、侧光/逆光；
-- 时间与天气：白天、夜晚、雨、雪、雾；
-- 整体色调和氛围。
-
-**Salient Objects**
-
-- 显著背景物和陈设：门、窗、沙发、桌子、灯、墙画、植物、书架、招牌、车辆等；
-- 不包含 prompt 主动提到的主体和关键道具，它们归 prompt-grounded track。
-
-**Spatial Layout**
-
-- 粗空间结构：门/窗/桌/沙发/墙面/道路/建筑的位置；
-- 粗关系：left/right/above/near/on/behind/in-front-of；
-- 不评精确几何距离、纹理细节、书架上几本书这类脆弱细节。
-
-### 4.2 View / Comparable-Shot Grouping
-
-Intrinsic track 的关键是先判断哪些镜头可比较。不要在人物特写中检查远景里的窗户，也不要把正反打的正常视角变化误判为空间漂移。
-
-推荐融合四类信号：
-
+```text
+- 模型自己生成的配角
+- prompt 未指定的家具
+- prompt 未指定的道具
+- prompt 未指定的墙面装饰
+- prompt 未指定的背景结构
+- 模型自己生成的服饰细节
 ```
-S_view(i,j) =
-  w1 * background_embedding_similarity
-+ w2 * local_feature_geometry_score
-+ w3 * large_anchor_layout_similarity
-+ w4 * global_state_similarity
+
+### 6.2 方法
+
+对每个 keyframe 提取 open-world proposals：
+
+```text
+keyframe
+→ open-world detection / segmentation
+→ proposal masks
+→ proposal crops
+→ proposal embeddings
 ```
 
 可用模块：
 
-- 背景 DINOv2 / CLIP embedding；
-- 人物 mask 后的局部特征匹配：SIFT / SuperPoint / LightGlue；
-- RANSAC homography / fundamental matrix inlier ratio；
-- 大结构 anchor 的 bbox 分布；
-- MLLM checkability judgment 作为低置信补充。
-
-输出 viewpoint groups：
-
-```json
-{
-  "group_id": "vp2",
-  "shots": ["S02", "S04", "S06"],
-  "confidence": 0.82,
-  "evidence": ["shared sofa/window layout", "high bg embedding", "RANSAC inliers"]
-}
+```text
+- GroundingDINO, when text prompts are available
+- YOLO / RT-DETR, for generic person / object detection
+- SAM / SAM2, for mask proposal extraction
+- Mask2Former, for panoptic segmentation
 ```
 
-### 4.3 组内一致性分数
+### 6.3 Proposal 过滤
 
-**Global State Consistency**
+过滤掉以下 proposal：
 
-对每个 shot 提取：
-
-- full-frame / background embedding；
-- brightness / saturation / color temperature / dominant color；
-- CLIP zero-shot 或 MLLM 分类：day/night, warm/cool, rainy/foggy, style type。
-
-```
-S_global(G) = mean_{i<j in G} sim(global_state_i, global_state_j)
-```
-
-**Salient Object Consistency**
-
-在同一视角组内，自动提取显著背景物候选，并只保留面积大、清晰、可命名、可重复观察的对象。比较方式：
-
-- detector / segmenter 定位候选；
-- crop embedding 相似度；
-- 属性一致性：颜色、形状、材质、图案；
-- 位置一致性：归一化 bbox 与局部上下文。
-
-```
-S_object(G) = mean over verifiable salient object matches
+```text
+- 面积过小
+- 面积过大且无明确结构
+- confidence 过低
+- 严重模糊
+- 与其他 proposal 高度重复
+- 纯背景纹理碎片
 ```
 
-如果某个物体在 reference shot 中出现，但后续 shot 不覆盖相同区域，则记为 `unverified`，不扣分。只有同一局部场景可见且该物体无证据存在时，才报告 Missing。
+输出保留：
 
-**Spatial Layout Consistency**
-
-把每个可比 shot 转为粗 layout graph：
-
-```json
-{
-  "nodes": ["sofa", "table", "window", "lamp"],
-  "edges": [
-    ["table", "in_front_of", "sofa"],
-    ["lamp", "right_of", "table"],
-    ["window", "behind", "sofa"]
-  ]
-}
-```
-
-比较同一视角组内可检查边的一致率：
-
-```
-S_layout(G) =
-  # consistent checkable relations / # checkable relations
-```
-
-只比较两个 anchor 都清楚可见的关系。
-
-### 4.4 Intrinsic 分数
-
-```
-IS-Coverage =
-  # verifiable intrinsic evidence / # potential salient evidence
-
-IS-Consistency =
-  weighted_mean(S_global, S_object, S_layout)
-```
-
-`IS-Coverage` 不应鼓励无限挖小细节，因此只统计通过 salience / clarity / repeatability 过滤的 evidence。主文可报告 `Scene Richness` 作为可解释版本。
-
----
-
-## 5. MLLM 的角色
-
-MLLM 不是唯一检测器，也不是最终打分器。它只承担三类任务：
-
-1. **结构化语义判断**：entity fidelity、action fidelity、same/different、scene checkability。
-2. **疑难视角判断**：当几何和 embedding 证据不足时，判断两个镜头是否可比较。
-3. **finding explanation**：把数值证据转成可读诊断。
-
-所有 MLLM 调用必须满足：
-
-- 输入有限、局部、可审计，例如 crops、frame grid、paired frames；
-- 输出 JSON schema；
-- 1-10 分归一化到 `[0,1]`；
-- 最终 score 由 evaluator 固定公式聚合；
-- 保存 response 供抽样检查。
-
-示例 schema：
-
-```json
-{
-  "verdict": "consistent",
-  "score": 8,
-  "criteria": {"color": 8, "shape": 9, "position": 7},
-  "evidence": "The lamp remains on the right side of the table.",
-  "confidence": 0.78
-}
+```text
+- person proposals
+- face proposals
+- object proposals
+- salient background-region proposals
 ```
 
 ---
 
-## 6. 聚合指标
+## 7. Step 4: Foreground / Background Separation
 
-### 6.1 四个主维度
+### 7.1 目的
 
-```
-PG-Coverage
-PG-Consistency
-IS-Coverage / Scene Richness
-IS-Consistency
-```
+背景同视角分组需要尽量减少人物、物体和主体动作的干扰，因此需要获得 foreground mask 和 background mask。
 
-这四项应作为主要 leaderboard 表格和散点图展示。
+### 7.2 流程
 
-### 6.2 Scene Continuity Score
-
-当需要单一排序时：
-
-```
-SCS = sum_c w_c * score_c * opp_c / sum_c w_c * opp_c
+```text
+keyframe
+→ detect prompt-specified entities
+→ detect open-world foreground proposals
+→ segment foreground
+→ merge foreground masks
+→ background mask = not foreground mask
 ```
 
-其中 `c` 包括：
+### 7.3 输出
 
-- prompt character / face；
-- prompt object；
-- prompt action / state；
-- prompt relation；
-- intrinsic global state；
-- intrinsic salient object；
-- intrinsic spatial layout。
+对每个 keyframe 输出：
 
-`opp_c` 是可比较机会数，例如：
-
-- 同一实体出现的 shot 对数；
-- 同一视角组内 frame / shot 对数；
-- 可检查 layout relation 数；
-- 可检查 salient object matches。
-
-同时报告 coverage，避免 `SCS` 掩盖空洞生成。
-
-### 6.3 Typed Findings
-
-输出格式：
-
-```json
-{
-  "track": "intrinsic",
-  "element": "lamp_around_table",
-  "error_type": "SpatialDrift",
-  "affected_shots": ["S01", "S04"],
-  "evidence": {
-    "layout_relation": "lamp right_of table -> lamp left_of table",
-    "score": 0.42,
-    "threshold": 0.65
-  },
-  "confidence": 0.81,
-  "severity": "major"
-}
+```text
+- character masks
+- object masks
+- foreground mask
+- background mask
+- background-visible ratio
 ```
 
-错误类型沿用：
+### 7.4 注意
 
-- Missing
-- Appearance Drift
-- State Drift
-- Spatial Drift
-- Lighting / Atmosphere Drift
+不要求对被遮挡区域做 inpainting。  
+后续提取背景特征时，可以直接使用 background mask 对 DINOv2 patch tokens 做 masked pooling。
 
 ---
 
-## 7. 受控扰动验证
+## 8. Step 5: Entity Association
 
-为验证 evaluator 可信度，构造独立扰动集。对原本较稳定的视频片段注入可控错误：
+### 8.1 目的
 
-- 改色：杯子、衣服、灯光色温；
-- 删除/添加：显著道具或背景物；
-- 替换：人脸、服装、墙画；
-- 平移：家具、窗户、灯；
-- 改变全局状态：夜晚变白天、暖光变冷光。
+将每个 keyframe 中检测到的 proposal 关联到两类实体集合：
 
-验证指标：
-
-```
-Detection Rate: 注入错误被对应 finding 检出的比例
-False Positive Rate: 未扰动区域被误报的比例
-Localization Accuracy: affected shots 是否命中
-Monotonicity: 扰动强度增加时 score 是否单调下降
+```text
+A. Prompt-specified entities
+B. Model-emergent entities
 ```
 
-扰动验证不能证明覆盖所有生成模型的自然错误，但可以证明每个指标对其目标错误类型有基本灵敏度。
+### 8.2 Prompt-specified association
+
+对于 prompt 中指定的实体：
+
+```text
+prompt entity description
++ keyframe proposal
+→ matching score
+→ assigned prompt entity id
+```
+
+匹配可以基于：
+
+```text
+- detection class / text grounding score
+- crop embedding similarity
+- spatial and temporal continuity
+- face embedding, for characters
+- object embedding, for objects
+```
+
+如果某个 scheduled shot 中没有匹配到 prompt 指定实体，记录为 missing。
+
+### 8.3 Model-emergent association
+
+对于没有被分配到 prompt-specified entity 的 proposal，进入 model-emergent pool。
+
+```text
+unassigned proposals
+→ embedding extraction
+→ cross-shot clustering
+→ emergent entity tracks
+```
+
+model-emergent track 的要求是：
+
+```text
+- 至少在两个 shot 或多个 keyframes 中出现
+- embedding similarity 足够高
+- proposal 类型一致或视觉特征一致
+```
 
 ---
 
-## 8. 实现模块清单
+## 9. Step 6: Character Consistency Evaluation
 
-| 阶段 | 工具 / 模型 | 作用 |
-|---|---|---|
-| Shot 对齐 | PySceneDetect / HSV diff / DTW | shot boundary 与 prompt 对齐 |
-| Caption 解析 | rules + LLM JSON parser | prompt entity list |
-| Entity grounding | GroundingDINO / OWL-ViT | prompt entities 与 salient objects 定位 |
-| Text-image gate | CLIP | 检测结果过滤 |
-| Embedding | DINOv2 / CLIP image | crop / frame 相似度 |
-| Face identity | InsightFace / ArcFace | 人物身份一致 |
-| View grouping | DINO bg embedding + SIFT/SuperPoint/LightGlue + RANSAC | 可比视角分组 |
-| Layout | bbox relation graph | 粗空间关系 |
-| Global state | color stats + CLIP zero-shot + MLLM | 光影、时间、风格、氛围 |
-| MLLM | structured JSON judge | 语义判断与 findings |
+### 9.1 适用对象
+
+```text
+- prompt-specified characters
+- model-emergent characters
+```
+
+### 9.2 流程
+
+```text
+character crop / person proposal
+→ face detection
+→ face alignment
+→ ArcFace / InsightFace embedding
+→ face similarity computation
+```
+
+### 9.3 推荐模型
+
+```text
+- RetinaFace / SCRFD for face detection
+- ArcFace / InsightFace for face embedding
+```
+
+### 9.4 指标定义
+
+设同一 character track 中第 i 次出现的人脸 embedding 为 `f_i`。
+
+#### Pairwise FaceSim
+
+```text
+FaceSim(i, j) = cosine(f_i, f_j)
+```
+
+#### Centroid FaceSim
+
+```text
+face_centroid = mean(normalized(f_i))
+FaceSim_centroid(i) = cosine(f_i, face_centroid)
+```
+
+### 9.5 Prompt-specified character metrics
+
+```text
+- prompt_character_presence_rate
+- prompt_face_detection_rate
+- prompt_face_mean_similarity
+- prompt_face_min_similarity
+- prompt_face_similarity_std
+- prompt_identity_pass_rate
+```
+
+### 9.6 Model-emergent character metrics
+
+```text
+- emergent_character_count
+- emergent_character_recurrence_rate
+- emergent_face_mean_similarity
+- emergent_face_min_similarity
+- emergent_face_similarity_std
+- emergent_identity_fragmentation_rate
+```
+
+### 9.7 解释
+
+Prompt-specified character metrics 评价：
+
+```text
+prompt 要求的人是否出现，并保持同一身份
+```
+
+Model-emergent character metrics 评价：
+
+```text
+模型自己生成的人物是否在多 shot 中自一致
+```
 
 ---
 
-## 附录 A：当前穿帮样例如何落入通用框架
+## 10. Step 7: Object Consistency Evaluation
 
-当前 `data/穿帮镜头/1.mp4 + 2.mp4` 可作为 pipeline sanity check，而不是 benchmark 定义本身。
+### 10.1 适用对象
 
-可见问题：
+```text
+- prompt-specified objects
+- model-emergent objects
+```
 
-1. **Prompt-grounded / subject appearance drift**：主体 3 的上衣在圆领针织与开衫之间漂移。
-2. **Intrinsic / salient object state drift**：桌面道具数量在可比餐桌视角中变化。
-3. **Intrinsic / spatial layout negative control**：卡座、百叶窗、挂画大体稳定，应该得到较高背景结构分，避免 evaluator 全部误报。
+### 10.2 流程
 
-本 case 也暴露了 Stage 1 的现实问题：AI 视频常把分镜渲成连续运镜，纯内容差分会漏检软分镜或误检快速运镜，因此正式 pipeline 应采用 shot detector + prompt-anchored alignment，而不是只依赖无监督切分。
+```text
+object proposal / crop
+→ DINOv2 feature extraction
+→ object embedding similarity
+→ object consistency metrics
+```
+
+### 10.3 特征
+
+推荐使用：
+
+```text
+- DINOv2 crop-level embedding
+- DINOv2 patch-token embedding
+```
+
+对于小物体，可以辅助使用：
+
+```text
+- color histogram
+- shape descriptor
+- mask area ratio
+```
+
+### 10.4 指标定义
+
+设同一 object track 中第 i 次出现的 embedding 为 `o_i`。
+
+```text
+ObjectSim(i, j) = cosine(o_i, o_j)
+```
+
+### 10.5 Prompt-specified object metrics
+
+```text
+- prompt_object_presence_rate
+- prompt_object_mean_similarity
+- prompt_object_min_similarity
+- prompt_object_similarity_std
+- prompt_object_pass_rate
+```
+
+### 10.6 Model-emergent object metrics
+
+```text
+- emergent_object_count
+- emergent_object_recurrence_rate
+- emergent_object_mean_similarity
+- emergent_object_min_similarity
+- emergent_object_similarity_std
+- emergent_object_fragmentation_rate
+```
+
+### 10.7 解释
+
+Prompt-specified object metrics 评价：
+
+```text
+prompt 要求的物体是否出现，并保持外观一致
+```
+
+Model-emergent object metrics 评价：
+
+```text
+模型自己生成的物体或道具是否在多 shot 中保持一致
+```
+
+---
+
+## 11. Step 8: Background Same-view Grouping
+
+### 11.1 目的
+
+将 keyframes 按同一视角分组。
+
+这里的“同一视角”指：
+
+```text
+- 相机朝向相近
+- 背景结构位置相近
+- 主要空间布局相近
+- 构图相近
+```
+
+不是简单的同一地点。
+
+例如：
+
+```text
+同一个厨房的正面视角和侧面视角不应被分到同一 same-view group。
+```
+
+---
+
+## 12. Step 8.1: Background Feature Extraction
+
+### 12.1 DINOv2 background patch feature
+
+对每个 keyframe 提取 DINOv2 patch tokens：
+
+```text
+tokens_i = DINOv2(keyframe_i)
+```
+
+使用 background mask 选择背景 patch：
+
+```text
+bg_tokens_i = tokens_i[background_mask_i == 1]
+```
+
+做 masked pooling：
+
+```text
+bg_feat_i = mean(bg_tokens_i)
+bg_feat_i = normalize(bg_feat_i)
+```
+
+背景相似度：
+
+```text
+S_dino_bg(i, j) = cosine(bg_feat_i, bg_feat_j)
+```
+
+### 12.2 背景可见性
+
+记录每帧背景可见比例：
+
+```text
+background_visible_ratio_i = area(background_mask_i) / area(frame_i)
+```
+
+如果背景可见比例太低，该帧不应强行参与 same-view grouping。
+
+---
+
+## 13. Step 8.2: Layout Feature Extraction
+
+为了避免将同一地点的不同视角误合并，需要加入 layout 特征。
+
+### 13.1 Depth layout
+
+```text
+depth_i = DepthModel(keyframe_i)
+depth_layout_i = resize(depth_i, 64x64)
+S_depth(i, j) = similarity(depth_layout_i, depth_layout_j)
+```
+
+similarity 可以使用：
+
+```text
+- cosine similarity
+- SSIM
+```
+
+### 13.2 Edge layout
+
+```text
+edge_i = EdgeDetector(keyframe_i)
+edge_layout_i = resize(edge_i, 64x64)
+S_edge(i, j) = similarity(edge_layout_i, edge_layout_j)
+```
+
+EdgeDetector 可以是：
+
+```text
+- Canny
+- HED
+- DexiNed
+```
+
+### 13.3 可选 segmentation layout
+
+如果已有 panoptic 或 segmentation 结果，可以得到区域级布局：
+
+```text
+S_seg(i, j) = similarity(seg_layout_i, seg_layout_j)
+```
+
+---
+
+## 14. Step 8.3: Weak Geometry Signal
+
+### 14.1 作用
+
+在生成视频中，局部纹理可能漂移，因此几何匹配只作为弱信号，不作为 hard rule。
+
+### 14.2 流程
+
+```text
+background-only regions
+→ local feature extraction
+→ feature matching
+→ RANSAC
+→ geometry score
+```
+
+可用：
+
+```text
+- SuperPoint + LightGlue
+- LoFTR
+- ALIKED + LightGlue
+```
+
+### 14.3 几何信号
+
+```text
+- num_inliers
+- inlier_ratio
+- mean_reprojection_error
+- matched_area_coverage
+- homography_overlap
+```
+
+定义：
+
+```text
+S_geo(i, j) =
+    clip(inlier_ratio, 0, 1)
+    * clip(matched_area_coverage, 0, 1)
+    * exp(-mean_reprojection_error / sigma)
+```
+
+---
+
+## 15. Step 8.4: Same-view Score
+
+### 15.1 综合分数
+
+```text
+same_view_score(i, j) =
+    0.55 * S_dino_bg(i, j)
+  + 0.20 * S_depth(i, j)
+  + 0.15 * S_edge(i, j)
+  + 0.10 * S_geo(i, j)
+```
+
+如果不使用几何信号：
+
+```text
+same_view_score(i, j) =
+    0.60 * S_dino_bg(i, j)
+  + 0.25 * S_depth(i, j)
+  + 0.15 * S_edge(i, j)
+```
+
+### 15.2 归一化
+
+所有分量统一归一化到 `[0, 1]`：
+
+```text
+S_norm = clip((S - p5) / (p95 - p5), 0, 1)
+```
+
+---
+
+## 16. Step 8.5: Same-view Grouping
+
+### 16.1 建图
+
+```text
+node = keyframe
+edge(i, j) exists if same_view_score(i, j) > threshold
+edge_weight = same_view_score(i, j)
+```
+
+推荐使用 mutual-kNN graph：
+
+```text
+edge(i, j) exists if:
+    i in topK(j) and j in topK(i)
+```
+
+### 16.2 聚类
+
+```text
+mutual-kNN graph
+→ graph clustering
+→ same-view groups
+```
+
+可用：
+
+```text
+- connected components
+- Louvain / Leiden
+- HDBSCAN
+- agglomerative clustering
+```
+
+### 16.3 每组代表帧
+
+对每个 same-view group 选择 medoid frame：
+
+```text
+medoid = argmax_i mean_j same_view_score(i, j)
+```
+
+代表帧应满足：
+
+```text
+- 背景可见比例高
+- 清晰度高
+- foreground 遮挡少
+- 与组内其他帧平均相似度高
+```
+
+---
+
+## 17. Step 9: Background Consistency Evaluation
+
+### 17.1 组内背景一致性
+
+对每个 same-view group `G`：
+
+```text
+intra_group_bg_similarity(G)
+    = mean_{i,j in G, i<j} S_dino_bg(i, j)
+```
+
+### 17.2 组内 layout 一致性
+
+```text
+intra_group_depth_similarity(G)
+    = mean_{i,j in G, i<j} S_depth(i, j)
+
+intra_group_edge_similarity(G)
+    = mean_{i,j in G, i<j} S_edge(i, j)
+```
+
+### 17.3 组内综合一致性
+
+```text
+intra_group_same_view_score(G)
+    = mean_{i,j in G, i<j} same_view_score(i, j)
+```
+
+### 17.4 Episode-level aggregation
+
+```text
+episode_same_view_consistency
+    = weighted_mean_G intra_group_same_view_score(G)
+```
+
+权重可以使用组内 pair 数：
+
+```text
+weight_G = |G| * (|G| - 1) / 2
+```
+
+---
+
+## 18. Step 10: View Confusion Matrix
+
+### 18.1 目的
+
+分析 same-view grouping 是否发生：
+
+```text
+- over-merge: 不同视角被合并
+- over-split: 同一视角被拆开
+```
+
+### 18.2 有视角标签时
+
+构建 confusion matrix：
+
+```text
+rows = predicted same-view groups
+columns = ground-truth view labels
+value = number of keyframes
+```
+
+### 18.3 无视角标签时
+
+可以基于少量人工 pair annotation：
+
+```text
+pair_label(i, j) ∈ {same-view, different-view}
+```
+
+报告：
+
+```text
+- pairwise precision
+- pairwise recall
+- pairwise F1
+- over-merge rate
+- over-split rate
+```
+
+---
+
+## 19. Final Metric Report
+
+最终报告分为四组，不混合为单一总分。
+
+### 19.1 Prompt-specified entity consistency
+
+```text
+- prompt_character_presence_rate
+- prompt_face_mean_similarity
+- prompt_identity_pass_rate
+- prompt_object_presence_rate
+- prompt_object_mean_similarity
+- prompt_object_pass_rate
+```
+
+### 19.2 Model-emergent self-consistency
+
+```text
+- emergent_character_count
+- emergent_character_recurrence_rate
+- emergent_face_mean_similarity
+- emergent_object_count
+- emergent_object_recurrence_rate
+- emergent_object_mean_similarity
+```
+
+### 19.3 Background same-view consistency
+
+```text
+- same_view_group_count
+- average_same_view_group_size
+- intra_group_bg_similarity
+- intra_group_depth_similarity
+- intra_group_edge_similarity
+- episode_same_view_consistency
+```
+
+### 19.4 View grouping quality
+
+```text
+- pairwise precision
+- pairwise recall
+- pairwise F1
+- over-merge rate
+- over-split rate
+- view confusion matrix
+```
+
+---
+
+## 20. Failure Case Taxonomy
+
+### 20.1 Prompt-specified entity failures
+
+```text
+- prompt 指定人物缺失
+- prompt 指定人物身份漂移
+- prompt 指定物体缺失
+- prompt 指定物体外观漂移
+- prompt 指定背景或地点发生漂移
+```
+
+### 20.2 Model-emergent self-consistency failures
+
+```text
+- 模型自发生成的配角身份不稳定
+- 模型自发生成的物体反复变化
+- 模型自发生成的背景装饰物消失或改变
+- 同一视觉元素被拆成多个 emergent tracks
+- 不同视觉元素被错误合并为同一个 emergent track
+```
+
+### 20.3 Same-view grouping failures
+
+```text
+- 同一地点不同视角被错误合并
+- 同一视角因为生成细节漂移被错误拆分
+- 前景人物遮挡导致背景特征失真
+- 局部纹理幻觉导致几何匹配误判
+```
+
+---
+
+## 21. Final Pipeline Summary
+
+```text
+1. Extract shot-level keyframes.
+
+2. Parse prompt-specified entities:
+   - characters
+   - objects
+   - backgrounds / locations
+
+3. Extract open-world proposals:
+   - persons
+   - faces
+   - objects
+   - salient background regions
+
+4. Segment foreground and background:
+   - foreground mask
+   - background mask
+   - background visible ratio
+
+5. Associate proposals:
+   - assign matched proposals to prompt-specified entities
+   - cluster unassigned recurring proposals as model-emergent entities
+
+6. Evaluate character consistency:
+   - ArcFace / InsightFace embeddings
+   - prompt-specified character metrics
+   - emergent character self-consistency metrics
+
+7. Evaluate object consistency:
+   - DINOv2 object embeddings
+   - prompt-specified object metrics
+   - emergent object self-consistency metrics
+
+8. Group backgrounds by same-view:
+   - DINOv2 background patch pooling
+   - depth layout similarity
+   - edge layout similarity
+   - optional weak geometry signal
+   - mutual-kNN graph clustering
+
+9. Evaluate same-view background consistency:
+   - intra-group background similarity
+   - intra-group layout similarity
+   - episode-level same-view consistency
+
+10. Output final report:
+   - prompt-specified entity consistency
+   - model-emergent self-consistency
+   - background same-view consistency
+   - view confusion matrix
+```
+
+---
+
+## 22. Deliverables
+
+```text
+pipeline_plan.md
+
+src/
+  extract_keyframes.py
+  parse_prompt_entities.py
+  extract_open_world_proposals.py
+  segment_foreground_background.py
+  associate_entities.py
+  extract_face_features.py
+  extract_object_features.py
+  extract_background_features.py
+  compute_same_view_score.py
+  cluster_same_view.py
+  evaluate_metrics.py
+
+outputs/
+  keyframes/
+  masks/
+  crops/
+  embeddings/
+  entity_tracks.json
+  same_view_groups.json
+  metrics.json
+  view_confusion_matrix.png
+  failure_cases/
+```
