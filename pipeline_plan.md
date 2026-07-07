@@ -1,212 +1,489 @@
-# 多镜头视频「场景连续性 / 穿帮」评测流水线 —— 落地方案
+# 多镜头视频场景连续性评测流水线
 
-> 本方案针对 `data/穿帮镜头/1.mp4 + 2.mp4` 拼接成的单 case，给出**每个阶段的算法、参数、可迁移实现**，以及**每个分数的含义与计算公式**。
-> Stage 1 已在本地(Mac, 仅 ffmpeg+numpy)实测验证，结果见文末附录 A。Stage 2/3 需 GPU，给出可直接迁移的模型与伪代码。
-
----
-
-## 0. 记号与数据约定
-
-- **Case**：`combined.mp4 = concat(1.mp4@24fps, 2.mp4@24fps)`，1280×720，20.08s，482 帧。
-- **Prompt 真值分镜**（拼接时间轴，用于对齐/评估 Stage 1）：
-  | shot | 时间 | 内容 | 视角类型 |
-  |---|---|---|---|
-  | S1 | 0–1s | 中景轨道横移 | wide/medium 正面 |
-  | S2 | 1–8s | 越肩(主体1肩) | over-shoulder |
-  | S3 | 8–11s | 近景 主体2/主体3 | close 正面 |
-  | S4 | 11–17s | 越肩(主体1肩) | over-shoulder |
-  | S5 | 17–20s | 近景 主体2/主体3 | close 正面 |
-- **实体定义**（referring expression，供 GroundingDINO 使用）：
-  | 实体 | prompt 描述 | GroundingDINO 文本 | 空间先验(线稿) |
-  |---|---|---|---|
-  | 场景基准 | 餐厅卡座 | — (背景) | 木质卡座+百叶窗+挂画 |
-  | 主体1 | 深色连帽卫衣/清瘦苍白男 | `dark jacket thin man` | 单独一侧，背对/左肩 |
-  | 主体2 | 黑色短袖微胖男 | `chubby man in black t-shirt` | 卡座右位 |
-  | 主体3 | 米色针织开衫干净女 | `woman in beige cardigan` | 卡座左位 |
-
-> ⚠️ 注意 prompt 与画面已有 fidelity 偏差（主体1 实际是夹克非连帽卫衣；主体3 上衣在不同 shot 在"圆领针织↔开衫"间漂移）。referring expression 用**稳定属性 + 座位先验**，不要照抄 prompt 里可能没兑现的细节。
+本文档对应 `proposal.md` 的落地方案。目标是保持评测框架清晰：输入只有生成视频与 shot-level caption；评测分为 **Prompt-grounded Continuity** 和 **Intrinsic Self-Consistency** 两条线；MLLM 用于结构化语义判断和诊断解释，最终分数由确定性规则聚合。
 
 ---
 
-## 1. Stage 1 — Shot 检测 + 关键帧提取
+## 0. 输入与输出
 
-### 1.1 算法（经典，无需 GPU）
-**内容差分法 (Content-based)**：逐帧算 HSV 直方图，相邻帧取卡方距离，自适应阈值找边界。
+### 输入
 
-```
-对每帧 t:
-  H_t = HSV 三通道联合直方图 (8×8×8=512 bins)，L1 归一化
-差分:  d_t = χ²(H_t, H_{t-1}) = 0.5 Σ (H_t - H_{t-1})² / (H_t + H_{t-1} + ε)
-阈值:  thr = mean(d) + k·std(d)   (k=3，自适应)
-边界:  d_t > thr 的 t；并做 min_scene_len(≥12帧=0.5s) 去抖 + 峰值 NMS
-```
+- `video`: 一个 episode 的多镜头生成视频，或多个已切分 shot video。
+- `captions`: episode / shot-level prompt，包含每个镜头的内容、动作、视角、镜头类型与时长。
 
-**服务器等价实现**：PySceneDetect `ContentDetector`（同为 HSV 加权差分）
-```python
-from scenedetect import detect, ContentDetector
-scenes = detect("combined.mp4", ContentDetector(threshold=27, min_scene_len=12))
-```
+### 输出
 
-### 1.2 关键难点与对策（本 case 实测暴露）
-AI 生成视频把"分镜"渲成**连续运镜**，只有**生成段之间**是硬切。纯差分法：
-- 强峰 t=11.04s(段间硬切) ✅、t=7.88s(S2→S3) ✅；
-- 弱/漏：1s、17s 切点；伪峰：2.21s(快速运镜)。
-
-**对策（三选一，推荐 C）**：
-- A. 降阈值 → 召回↑但伪切↑；
-- B. 加运动通道：光流幅度突变辅助判切（区分"运镜渐变"vs"硬切"）；
-- **C. Prompt-anchored 对齐（推荐）**：已知每个 case 的 prompt 声明了分镜数与时间，用**检测峰值去对齐/吸附到 prompt 声明的时间点**（DTW 或最近邻匹配），把"无监督切分"变成"有先验的边界修正"。评测本就要按 prompt 分镜比对，这一步天然合理。
-
-### 1.3 关键帧选择（改进版，不要直接取中点）
-中点帧常有运动模糊（如 S2 主体2 咀嚼）。在 shot 中段窗口 `[0.4L, 0.6L]` 内选：
-```
-score(f) = α·sharpness(f) − β·motion(f)
-  sharpness = var(Laplacian(gray))         # 越大越清晰
-  motion    = mean|f − f_prev| (光流或帧差)  # 越小越稳
-取 argmax 的帧为关键帧
-```
-可每 shot 取 1 主 + 2 辅关键帧，增强后续检测鲁棒性。
-
-### 1.4 输出
-`shots.json`: `[{shot_id, t_start, t_end, keyframe_path, prompt_text, viewpoint_hint}]`
+- `prompt_entities.json`: 从 caption 自动抽取的主动提及主体列表，用于审计。
+- `shot_table.json`: shot 边界、关键帧、可比视角组。
+- `scores.json`: coverage / consistency / SCS 等分数。
+- `findings.json`: 元素级、类型化、可定位的 continuity findings。
+- 可选 audit artifacts：canonical crops、关键帧、视角组可视化、MLLM JSON response。
 
 ---
 
-## 2. Stage 2 — 主体文本抽取 + GroundingDINO 检测（保留背景）
+## 1. 总体框架
 
-### 2.1 从 prompt 抽主体描述
-每个 shot 的 prompt 文本 → 解析"本镜应出现哪些实体"以及其 referring expression：
-- 规则/LLM 解析出现的 `<主体k>` 标签 → 查 §0 实体表得文本；
-- 区分**应可见** vs **仅提及**（如"越肩"镜头主体1只有肩膀）→ 标 `visibility_expected ∈ {full, partial, absent}`，供 Missing 判定用。
-
-### 2.2 GroundingDINO 开放词表检测
-```python
-# groundingdino (SwinT-OGC) 或 GroundingDINO-1.5
-boxes, logits, phrases = predict(
-    model, image=keyframe,
-    caption="dark jacket thin man . chubby man in black t-shirt . woman in beige cardigan .",
-    box_threshold=0.35, text_threshold=0.25)
 ```
-**消歧（关键）**：两男易混。用**座位空间先验**约束：
-- 主体1 → 取最靠画面左/背对镜头的框；主体3 → 卡座左位女性框；主体2 → 卡座右位框；
-- 每实体保留 top-1 框（按 score×先验匹配度）；冲突时用匈牙利算法在"实体↔框"间做二分匹配。
+video + shot captions
+        |
+Shot alignment and keyframes
+        |
+Caption entity extraction
+        |
++---------------------------+     +-----------------------------+
+| Prompt-grounded track     |     | Intrinsic scene track       |
+| caption 主动提到的元素     |     | 模型自己建立的场景信息       |
++---------------------------+     +-----------------------------+
+        |                                   |
+Grounding / crop / embedding        View grouping / scene evidence
+        |                                   |
+Structured MLLM judgment            Global / object / layout comparison
+        |                                   |
+        +---------------+-------------------+
+                        |
+       deterministic aggregation + typed findings
+```
 
-### 2.3 主体裁剪 + 背景保留
-- **主体 crop**：按框裁剪（外扩 10%），存 `crops/{shot}_{entity}.png`；
-- **背景图**：把所有主体框 + 动态前景(食物盘子)区域 mask 掉，得到 `bg/{shot}.png`（结构评分用）。食物盘子可用同一 GroundingDINO 文本 `plate of food . bottle .` 检出后并入 mask。
+两个 track 共享三个原则：
 
-### 2.4 输出
-`detections.json`: 每 keyframe `{entity: {box, score, crop_path}}`, `bg_path`, `prop_boxes`。
+1. **先建立可检查机会，再判断错误**：没有足够视觉证据时标记为 `unverified`，不直接记为错误。
+2. **分开报告 coverage 与 correctness**：避免空背景、低细节视频靠"无可检查内容"获得高分。
+3. **MLLM 不直接给总分**：MLLM 输出结构化 JSON，最终分数由固定公式计算。
 
 ---
 
-## 3. Stage 3 — 相似度打分
+## 2. Stage 1 — Shot 对齐与关键帧
 
-> 核心思想：**主体走 embedding+人脸，背景走"空间视角分组→组内比较"**。所有跨 shot 比较都带**视角门控**（同视角强比，跨视角保守）。
+### 2.1 Shot 对齐
 
-### 3.1 主体外观自一致 —— DINOv2 embedding
+优先使用 caption 中的分镜结构。如果模型输出为多个 shot video，直接使用边界；如果输出为连续视频，则结合内容差分与 prompt-anchored alignment。
+
+推荐实现：
+
 ```
-对每个实体 e 在其出现的每个 shot i： v_{e,i} = DINOv2-ViT-L/14(crop_{e,i})  # CLS + mean-patch, L2 归一化
-S_app(e) = mean_{i<j, gate(i,j)} cos(v_{e,i}, v_{e,j})
+1. HSV histogram / PySceneDetect 检测候选边界。
+2. 根据 caption 声明的 shot 数、时长或顺序做最近邻 / DTW 对齐。
+3. 对快速运镜导致的伪切进行最小镜头长度与光流平滑过滤。
 ```
-- **视角门控 gate(i,j)**：只在"两 shot 都能看到该主体的可比视角"时计入（如两个正面近景）；越肩镜头里主体1只有背影 → 不参与其外观比较，或单独作"背影一致"弱分。
-- **含义**：主体的服装/体型/发型跨镜是否自洽。**抓 Appearance Drift**（如主体3 圆领↔开衫漂移）。
 
-### 3.2 人脸身份一致 —— InsightFace (RetinaFace+ArcFace)
+AI 生成视频经常把分镜渲成连续运镜，所以纯 shot boundary detection 不可靠。prompt-anchored alignment 的作用不是提供连续性答案，而是保证后续评测按同一组 shot 进行。
+
+### 2.2 关键帧采样
+
+每个 shot 采样 3-6 帧，覆盖开头、中段、结尾。用于实体 grounding 的 canonical frame 由清晰度和运动幅度共同选择：
+
 ```
-对每个人物 p 每 shot： f_{p,i} = ArcFace(face_crop)  # 512-d
-S_face(p) = mean_{i<j} cos(f_{p,i}, f_{p,j})    # 无脸(背对)的 shot 跳过
+score(f) = sharpness(f) - lambda * motion(f)
+sharpness = var(Laplacian(gray))
+motion = mean |f_t - f_{t-1}| 或光流幅度
 ```
-- **含义**：身份是否被保持（无换脸/面部漂移）。ArcFace 对光照/角度比 DINO 更鲁棒，是人物一致性的主指标。
-- 主体外观分数 `S_subject(p) = w1·S_app + w2·S_face`（人物 w2 大，非人实体只有 S_app）。
 
-### 3.3 背景 / 场景一致 —— 空间视角分组 + 组内多分数
+输出：
 
-**Step A. 空间视角分组（无 MLLM，几何法）**
-```
-1. 每 keyframe 背景图 → 全局特征 g_i (DINOv2 on bg) ；
-2. 局部特征匹配几何验证：SuperPoint+LightGlue(或 SIFT) 提点，
-   两两匹配 → RANSAC 估单应 H_ij，记 inlier 数 n_ij；
-3. 亲和矩阵 A_ij = 归一化(n_ij) 融合 cos(g_i,g_j)；
-4. 谱聚类 / 阈值连通分量 → 视角组 {vp1(宽景), vp2(越肩), vp3(近景)...}；
-   本质矩阵恢复相对位姿可进一步区分"同侧 vs 正反打"。
-```
-> 生成视频无真实 3D，几何法在纹理丰富的宽景(S1/S4背景)可靠、在暗糊近景弱 → 弱处退回全局 embedding 分组，并记 `group_confidence`。
-
-**Step B. 组内分数**（同视角组内，背景已 mask 掉人和食物）
-
-| 分数 | 计算 | 含义 / 抓什么 |
-|---|---|---|
-| `B_struct(g)` 结构一致 | 组内 keyframe 两两背景区域 mean **SSIM**（或 1−LPIPS），先用 H_ij 对齐 | 陈设/墙面/百叶窗/挂画是否稳定 → **背景漂移** |
-| `B_geo(g)` 几何一致 | 组内 RANSAC 中位 **inlier_ratio**（或重投影误差倒数） | 场景是否扭曲/结构错乱 → **Spatial Drift / 结构崩** |
-| `B_prop(g)` 道具一致 | 匹配道具框(瓶/盘)：`1 − |ΔN|/N_max` × 位置 IoU | **道具凭空增减**(本 case: shot1→shot4 盘子变多) |
-| `L_seat` 座位一致(全局) | 各主体框中心的**左右次序 & 相对位置**与线稿一致率 | 三人座位**位置跳变** |
-
----
-
-## 4. Stage 4 — 汇总与 findings
-
-### 4.1 分数字典（case 级）
-| 符号 | 名称 | 范围 | 归一化后含义 |
-|---|---|---|---|
-| S_pres(e) | 出现率 | [0,1] | 应出现且被检出的 shot 比例 → Missing |
-| S_face(p) | 人脸一致 | [0,1] | 身份保持 |
-| S_app(e) | 外观一致 | [0,1] | 服装/外观自洽 |
-| B_struct/geo/prop | 背景三项 | [0,1] | 场景陈设/几何/道具自洽 |
-| L_seat | 座位一致 | [0,1] | 空间关系自洽 |
-
-**Scene Continuity Score**（主指标，按"机会数"归一化，避免空场景占便宜）：
-```
-SCS = Σ_c (w_c · score_c · opp_c) / Σ_c (w_c · opp_c)
-  opp_c = 该维度的"可比较机会数"(如实体出现的 shot 对数、组内帧对数)
-```
-配合**诊断表**：每类 error 的发生率、每个实体/每个视角组的错误率。
-
-### 4.2 Typed findings（诊断输出）
 ```json
-{"entity":"主体3","type":"AppearanceDrift","shots":[2,4],
- "evidence":"S_app=0.71<τ; 圆领针织→开衫","confidence":0.8,"severity":"minor"}
-{"entity":"table_props","type":"StateDrift/PropAdded","shots":[1,4],
- "evidence":"B_prop=0.6; 盘数 1→3","confidence":0.75,"severity":"major"}
+{
+  "shot_id": "S03",
+  "time_range": [8.0, 11.0],
+  "caption": "...",
+  "keyframes": ["S03_f1.png", "S03_f2.png", "S03_f3.png"]
+}
 ```
 
 ---
 
-## 5. 运行位置与模型清单
+## 3. Stage 2 — Prompt-Grounded Continuity
 
-| 阶段 | 模型/工具 | 本地(Mac) | 服务器(GPU) |
-|---|---|---|---|
-| Shot 检测/关键帧 | ffmpeg + numpy / PySceneDetect | ✅ 已跑通 | ✅ |
-| 主体检测 | GroundingDINO SwinT-OGC | ✗ | ✅ |
-| 主体 embedding | DINOv2 ViT-L/14 | ✗(慢) | ✅ |
-| 人脸 | InsightFace buffalo_l (RetinaFace+ArcFace) | ✗ | ✅ |
-| 视角分组 | SuperPoint+LightGlue / OpenCV SIFT+RANSAC | ⚠️CPU可跑慢 | ✅ |
-| 结构相似 | SSIM(skimage) / LPIPS | SSIM✅ LPIPS✗ | ✅ |
+这条线评估 caption 主动提到的主体、物体、地点、动作状态和显式关系。它学习 EntityBench 的经验，但目标从 entity consistency 扩展到 continuity diagnosis。
 
-安装（服务器）：
+### 3.1 Caption Entity Extraction
+
+从 shot-level caption 自动抽取：
+
+- `characters`: 人物及稳定描述，如外观、服装、身份标签；
+- `objects`: 关键道具和被交互物；
+- `locations`: 明确地点或场景区域；
+- `actions/states`: 拿起、放下、递交、坐下、站立等状态变化；
+- `relations`: A beside B, object on table, person left of person 等显式关系。
+
+可以用规则 + LLM 解析，但输出必须是结构化、可审计 JSON：
+
+```json
+{
+  "shot_id": "S02",
+  "characters": [
+    {
+      "id": "woman_1",
+      "description": "woman in a beige cardigan",
+      "expected_visibility": "visible"
+    }
+  ],
+  "objects": [
+    {
+      "id": "mug_1",
+      "description": "blue ceramic mug",
+      "state": "on the table"
+    }
+  ],
+  "relations": [
+    {"subject": "mug_1", "relation": "on", "object": "table"}
+  ]
+}
 ```
-pip install scenedetect opencv-python torch torchvision \
-    groundingdino-py insightface onnxruntime-gpu \
-    scikit-image lpips kornia   # kornia 提供 LoFTR/LightGlue
+
+这里的 entity list 来自 caption，不是人工 continuity contract。它只定义 prompt-grounded track 的候选对象。
+
+### 3.2 Grounding 与 Canonical Evidence
+
+对每个 prompt entity，在对应 shot 的 sampled frames 中定位：
+
+- open-vocabulary detector：GroundingDINO / OWL-ViT；
+- CLIP text-image similarity gate；
+- crop quality gate：面积、清晰度、遮挡程度；
+- 人物可加 face detector / ArcFace；
+- 动作用 annotated multi-frame grid。
+
+canonical crop 的选择可以采用：
+
+```
+selection = detector_confidence * clip_similarity * sharpness_score * area_score
+```
+
+输出每个 `(shot, entity)` 的三态：
+
+- `present`: 检出且通过 CLIP / quality gate；
+- `weak`: 有候选但置信度不足，可供 MLLM 审计；
+- `absent`: 未检出或无可用证据。
+
+### 3.3 Prompt-Grounded 分数
+
+**Coverage**
+
+```
+PG-Coverage = # present prompt entity slots / # scheduled prompt entity slots
+```
+
+按 character / object / location / action 分开报告。
+
+**Entity Fidelity**
+
+对 canonical crop 与 caption description 做结构化 MLLM 判断，输出 1-10 并归一化到 `[0,1]`。criteria 可采用类型化 rubric：
+
+- character: face / hair / clothing / build
+- object: shape / color_texture / proportions / details
+- location: layout / color_mood / landmarks / perspective
+
+**Cross-shot Consistency**
+
+对跨多个 shot 出现的 prompt entity：
+
+```
+emb_{e,i} = DINOv2(crop_{e,i})
+centroid_e = normalize(mean_i emb_{e,i})
+CS_emb(e) = mean_i cos(emb_{e,i}, centroid_e)
+```
+
+人物身份可另算：
+
+```
+CS_face(p) = mean_{i<j} cos(ArcFace(face_{p,i}), ArcFace(face_{p,j}))
+```
+
+MLLM 可做 anchor-vs-each 或 set-based structured judge，输出：
+
+```json
+{
+  "is_same": true,
+  "similarity": 8,
+  "criteria": {"clothing": 7, "face": 9},
+  "reason": "..."
+}
+```
+
+最终分数使用固定聚合，而不是 MLLM 总分。
+
+**Prompt-Grounded Consistency**
+
+```
+PG-Consistency =
+  weighted_mean(CS_emb, CS_face, state_consistency, relation_consistency)
+```
+
+只在可检查机会中计算；低 fidelity 的错误 crop 可 gate out，避免"错误但一致"获得高分。
+
+---
+
+## 4. Stage 3 — Intrinsic Self-Consistency
+
+这条线评估模型自己建立的场景世界。我们不为每个 case 提前构造复杂 registry，也不试图追踪所有背景细节。每个生成视频在线处理，只检查三类普适且可检测的证据。
+
+### 4.1 可检测范围
+
+**Global State**
+
+- 风格：真人、动漫、3D、插画、油画感等；
+- 光影：暖光/冷光、明亮/昏暗、侧光/逆光；
+- 时间与天气：白天、夜晚、雨、雪、雾；
+- 整体色调和氛围。
+
+**Salient Objects**
+
+- 显著背景物和陈设：门、窗、沙发、桌子、灯、墙画、植物、书架、招牌、车辆等；
+- 不包含 prompt 主动提到的主体和关键道具，它们归 prompt-grounded track。
+
+**Spatial Layout**
+
+- 粗空间结构：门/窗/桌/沙发/墙面/道路/建筑的位置；
+- 粗关系：left/right/above/near/on/behind/in-front-of；
+- 不评精确几何距离、纹理细节、书架上几本书这类脆弱细节。
+
+### 4.2 View / Comparable-Shot Grouping
+
+Intrinsic track 的关键是先判断哪些镜头可比较。不要在人物特写中检查远景里的窗户，也不要把正反打的正常视角变化误判为空间漂移。
+
+推荐融合四类信号：
+
+```
+S_view(i,j) =
+  w1 * background_embedding_similarity
++ w2 * local_feature_geometry_score
++ w3 * large_anchor_layout_similarity
++ w4 * global_state_similarity
+```
+
+可用模块：
+
+- 背景 DINOv2 / CLIP embedding；
+- 人物 mask 后的局部特征匹配：SIFT / SuperPoint / LightGlue；
+- RANSAC homography / fundamental matrix inlier ratio；
+- 大结构 anchor 的 bbox 分布；
+- MLLM checkability judgment 作为低置信补充。
+
+输出 viewpoint groups：
+
+```json
+{
+  "group_id": "vp2",
+  "shots": ["S02", "S04", "S06"],
+  "confidence": 0.82,
+  "evidence": ["shared sofa/window layout", "high bg embedding", "RANSAC inliers"]
+}
+```
+
+### 4.3 组内一致性分数
+
+**Global State Consistency**
+
+对每个 shot 提取：
+
+- full-frame / background embedding；
+- brightness / saturation / color temperature / dominant color；
+- CLIP zero-shot 或 MLLM 分类：day/night, warm/cool, rainy/foggy, style type。
+
+```
+S_global(G) = mean_{i<j in G} sim(global_state_i, global_state_j)
+```
+
+**Salient Object Consistency**
+
+在同一视角组内，自动提取显著背景物候选，并只保留面积大、清晰、可命名、可重复观察的对象。比较方式：
+
+- detector / segmenter 定位候选；
+- crop embedding 相似度；
+- 属性一致性：颜色、形状、材质、图案；
+- 位置一致性：归一化 bbox 与局部上下文。
+
+```
+S_object(G) = mean over verifiable salient object matches
+```
+
+如果某个物体在 reference shot 中出现，但后续 shot 不覆盖相同区域，则记为 `unverified`，不扣分。只有同一局部场景可见且该物体无证据存在时，才报告 Missing。
+
+**Spatial Layout Consistency**
+
+把每个可比 shot 转为粗 layout graph：
+
+```json
+{
+  "nodes": ["sofa", "table", "window", "lamp"],
+  "edges": [
+    ["table", "in_front_of", "sofa"],
+    ["lamp", "right_of", "table"],
+    ["window", "behind", "sofa"]
+  ]
+}
+```
+
+比较同一视角组内可检查边的一致率：
+
+```
+S_layout(G) =
+  # consistent checkable relations / # checkable relations
+```
+
+只比较两个 anchor 都清楚可见的关系。
+
+### 4.4 Intrinsic 分数
+
+```
+IS-Coverage =
+  # verifiable intrinsic evidence / # potential salient evidence
+
+IS-Consistency =
+  weighted_mean(S_global, S_object, S_layout)
+```
+
+`IS-Coverage` 不应鼓励无限挖小细节，因此只统计通过 salience / clarity / repeatability 过滤的 evidence。主文可报告 `Scene Richness` 作为可解释版本。
+
+---
+
+## 5. MLLM 的角色
+
+MLLM 不是唯一检测器，也不是最终打分器。它只承担三类任务：
+
+1. **结构化语义判断**：entity fidelity、action fidelity、same/different、scene checkability。
+2. **疑难视角判断**：当几何和 embedding 证据不足时，判断两个镜头是否可比较。
+3. **finding explanation**：把数值证据转成可读诊断。
+
+所有 MLLM 调用必须满足：
+
+- 输入有限、局部、可审计，例如 crops、frame grid、paired frames；
+- 输出 JSON schema；
+- 1-10 分归一化到 `[0,1]`；
+- 最终 score 由 evaluator 固定公式聚合；
+- 保存 response 供抽样检查。
+
+示例 schema：
+
+```json
+{
+  "verdict": "consistent",
+  "score": 8,
+  "criteria": {"color": 8, "shape": 9, "position": 7},
+  "evidence": "The lamp remains on the right side of the table.",
+  "confidence": 0.78
+}
 ```
 
 ---
 
-## 附录 A：Stage 1 本地实测结果（已验证）
+## 6. 聚合指标
 
-- combined.mp4：482 帧 / 20.08s / 24fps。
-- HSV χ² 差分：mean=0.0040, std=0.0117, max=0.1338；自适应阈值 mu+3sd=0.039。
-- 检出边界(帧, 时间, 分数)：
-  ```
-  frame 189  t=7.88s   χ²=0.094   → 命中 S2→S3 (真值8s)
-  frame 265  t=11.04s  χ²=0.134   → 命中 段间硬切 (真值11s) [最强]
-  frame 438  t=18.25s  χ²=0.076   → 对应 S4→S5 (真值17s，偏晚)
-  frame  53  t=2.21s   χ²=0.115   → 伪切(快速运镜)  ← 需运动通道/prompt对齐剔除
-  ```
-- 结论：纯差分对**硬切可靠、软分镜漏检、快速运镜误检** → 采用 §1.2-C Prompt-anchored 对齐。
-- 关键帧样本已生成于 `scratchpad/keyframes/kf_shot{1..5}_*.png`（5 个 prompt 分镜中点帧）。
+### 6.1 四个主维度
 
-## 附录 B：本 case 肉眼可见的连续性问题（供验证 pipeline 召回）
-1. **道具增减**：shot1(菜单+少量) → shot4(多盘咖喱+馒头碗) 桌面道具凭空增多 → `B_prop` 应低。
-2. **主体3 上衣漂移**：shot2/3(圆领针织感) → shot4/5(明显开衫+白衬衫) → `S_app(主体3)` 应低。
-3. **背景固定元素**（百叶窗/挂画/卡座）基本稳定 → `B_struct` 应高（作为负样本校验，避免全判错）。
+```
+PG-Coverage
+PG-Consistency
+IS-Coverage / Scene Richness
+IS-Consistency
+```
+
+这四项应作为主要 leaderboard 表格和散点图展示。
+
+### 6.2 Scene Continuity Score
+
+当需要单一排序时：
+
+```
+SCS = sum_c w_c * score_c * opp_c / sum_c w_c * opp_c
+```
+
+其中 `c` 包括：
+
+- prompt character / face；
+- prompt object；
+- prompt action / state；
+- prompt relation；
+- intrinsic global state；
+- intrinsic salient object；
+- intrinsic spatial layout。
+
+`opp_c` 是可比较机会数，例如：
+
+- 同一实体出现的 shot 对数；
+- 同一视角组内 frame / shot 对数；
+- 可检查 layout relation 数；
+- 可检查 salient object matches。
+
+同时报告 coverage，避免 `SCS` 掩盖空洞生成。
+
+### 6.3 Typed Findings
+
+输出格式：
+
+```json
+{
+  "track": "intrinsic",
+  "element": "lamp_around_table",
+  "error_type": "SpatialDrift",
+  "affected_shots": ["S01", "S04"],
+  "evidence": {
+    "layout_relation": "lamp right_of table -> lamp left_of table",
+    "score": 0.42,
+    "threshold": 0.65
+  },
+  "confidence": 0.81,
+  "severity": "major"
+}
+```
+
+错误类型沿用：
+
+- Missing
+- Appearance Drift
+- State Drift
+- Spatial Drift
+- Lighting / Atmosphere Drift
+
+---
+
+## 7. 受控扰动验证
+
+为验证 evaluator 可信度，构造独立扰动集。对原本较稳定的视频片段注入可控错误：
+
+- 改色：杯子、衣服、灯光色温；
+- 删除/添加：显著道具或背景物；
+- 替换：人脸、服装、墙画；
+- 平移：家具、窗户、灯；
+- 改变全局状态：夜晚变白天、暖光变冷光。
+
+验证指标：
+
+```
+Detection Rate: 注入错误被对应 finding 检出的比例
+False Positive Rate: 未扰动区域被误报的比例
+Localization Accuracy: affected shots 是否命中
+Monotonicity: 扰动强度增加时 score 是否单调下降
+```
+
+扰动验证不能证明覆盖所有生成模型的自然错误，但可以证明每个指标对其目标错误类型有基本灵敏度。
+
+---
+
+## 8. 实现模块清单
+
+| 阶段 | 工具 / 模型 | 作用 |
+|---|---|---|
+| Shot 对齐 | PySceneDetect / HSV diff / DTW | shot boundary 与 prompt 对齐 |
+| Caption 解析 | rules + LLM JSON parser | prompt entity list |
+| Entity grounding | GroundingDINO / OWL-ViT | prompt entities 与 salient objects 定位 |
+| Text-image gate | CLIP | 检测结果过滤 |
+| Embedding | DINOv2 / CLIP image | crop / frame 相似度 |
+| Face identity | InsightFace / ArcFace | 人物身份一致 |
+| View grouping | DINO bg embedding + SIFT/SuperPoint/LightGlue + RANSAC | 可比视角分组 |
+| Layout | bbox relation graph | 粗空间关系 |
+| Global state | color stats + CLIP zero-shot + MLLM | 光影、时间、风格、氛围 |
+| MLLM | structured JSON judge | 语义判断与 findings |
+
+---
+
+## 附录 A：当前穿帮样例如何落入通用框架
+
+当前 `data/穿帮镜头/1.mp4 + 2.mp4` 可作为 pipeline sanity check，而不是 benchmark 定义本身。
+
+可见问题：
+
+1. **Prompt-grounded / subject appearance drift**：主体 3 的上衣在圆领针织与开衫之间漂移。
+2. **Intrinsic / salient object state drift**：桌面道具数量在可比餐桌视角中变化。
+3. **Intrinsic / spatial layout negative control**：卡座、百叶窗、挂画大体稳定，应该得到较高背景结构分，避免 evaluator 全部误报。
+
+本 case 也暴露了 Stage 1 的现实问题：AI 视频常把分镜渲成连续运镜，纯内容差分会漏检软分镜或误检快速运镜，因此正式 pipeline 应采用 shot detector + prompt-anchored alignment，而不是只依赖无监督切分。
